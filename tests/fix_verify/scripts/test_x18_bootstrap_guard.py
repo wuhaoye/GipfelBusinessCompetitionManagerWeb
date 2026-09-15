@@ -17,6 +17,13 @@
     第二次运行时守卫被判定为"已重入"而跳过，脚本按普通批处理在当前窗口运行，结尾的裸
     `exit 1` 直接把调用方的 cmd 进程杀掉 —— 正是文件顶部维护规则第 1 条要避免的"闪退"。
 
+后续补充（同一份守卫引入的新缺陷，已一并回归）：保窗守卫里的裸 `shift` 会**连 `%0` 一起移掉**，
+于是守卫之后的每一个 `%~dp0` 都从"脚本所在目录"变成"第一个参数"。走 `--no-keep-open`
+（文档推荐给 CI/自动化的开关）时 `%SCRIPT_DIR%` 缺失，`BACKEND` 解析到仓库的**上一级**，
+实测报 `[ERROR] missing ...\GipfelBusinessCompetitionManagerWeb\..\backend\requirements.txt` 并退出 1。
+修法：在任何 shift 之前 `set "SCRIPT_DIR=%~dp0"`，后续一律用 `%SCRIPT_DIR%`。
+见 X18StaticTests.test_script_dir_is_captured_before_any_shift / test_paths_use_the_captured_script_dir。
+
 运行：backend/.venv/Scripts/python.exe tests/fix_verify/scripts/test_x18_bootstrap_guard.py
 """
 
@@ -63,7 +70,39 @@ class X18StaticTests(unittest.TestCase):
 
     def test_no_keep_open_path_runs_inline(self):
         self.assertIn('if /i "%~1"=="--no-keep-open" goto :guard_done', self.code)
-        self.assertIn('if /i "%~1"=="--no-keep-open" shift', self.code)
+
+    def test_script_dir_is_captured_before_any_shift(self):
+        """cmd 的 shift 会连 %0 一起移掉，之后 %~dp0 就变成"第一个参数"。
+
+        改前实测（本机 cmd.exe，`bootstrap-dev.bat --no-keep-open --skip-frontend`）：
+
+            AFTER1: 0=[--no-keep-open]  1=[--skip-frontend]
+                    dp0=[C:\\...\\GipfelBusinessCompetitionManagerWeb\\]   ← 少了 scripts\\ 这一级
+
+        于是 BACKEND 解析成 `...\\GipfelBusinessCompetitionManagerWeb\\..\\backend`（上一级），
+        脚本在 `missing ...\\..\\backend\\requirements.txt` 处报错退出 1 —— 而 `--no-keep-open`
+        正是文档推荐给 CI/自动化用的开关。修法：在任何 shift 之前把目录固化到 SCRIPT_DIR。
+        """
+        # 固化语句必须存在，且位于保窗守卫（第一次 shift）之前
+        self.assertIn('set "SCRIPT_DIR=%~dp0"', self.code)
+        self.assertLess(
+            self.code.index('set "SCRIPT_DIR=%~dp0"'),
+            self.code.index('cmd /k call "%~f0" __kept__ %*'),
+            "SCRIPT_DIR 必须在守卫块（含 shift）之前固化",
+        )
+        # shift 之后不得再出现 %~dp0
+        first_shift = self.code.index("shift")
+        tail = self.code[first_shift:]
+        self.assertNotIn(
+            "%~dp0", tail,
+            "shift 之后仍在使用 %~dp0 —— 它会指向第一个参数而不是脚本目录",
+        )
+
+    def test_paths_use_the_captured_script_dir(self):
+        """BACKEND/FRONTEND/被调用的 .py 都必须走 SCRIPT_DIR，不能依赖 cwd 或 %~dp0。"""
+        self.assertIn('set "BACKEND=%SCRIPT_DIR%..\\backend"', self.code)
+        self.assertIn('set "FRONTEND=%SCRIPT_DIR%..\\frontend"', self.code)
+        self.assertIn('"%PY%" "%SCRIPT_DIR%gen_logviewer_key.py"', self.code)
 
     def test_batch_returns_instead_of_killing_the_caller(self):
         self.assertNotRegex(self.code, r"(?m)^exit [01]\s*$", "结尾仍是裸 exit，会杀掉调用方 cmd")

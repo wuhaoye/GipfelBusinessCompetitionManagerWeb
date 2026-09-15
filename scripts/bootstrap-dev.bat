@@ -14,6 +14,10 @@ REM       An empty VAR rewrites the line to "if  LSS 3 (" = same hard abort.
 REM    3. Variables set inside a block are expanded when the block is parsed,
 REM       so echo them AFTER the block, not inside it.
 REM    4. Keep this file pure ASCII with CRLF line endings.
+REM    5. NEVER rely on %~dp0 AFTER a plain "shift". cmd's shift moves %0
+REM       as well, so %~dp0 stops meaning "this script's folder" and starts
+REM       meaning "the first argument". The folder is captured into SCRIPT_DIR
+REM       BEFORE any shift below - always use %SCRIPT_DIR%, never %~dp0.
 REM
 REM  What it does:
 REM    1. Check Python >=3.10 and Node/npm
@@ -26,6 +30,15 @@ REM  Optional: pass --skip-frontend to skip Node/npm steps.
 REM  Optional: pass --no-keep-open to run inline and return the real exit
 REM            code (use this from scripts/CI; it never spawns cmd /k).
 REM ========================================================================
+
+REM --- capture our own folder BEFORE any shift below -----------------------
+REM Audit: cmd's `shift` also discards %0. Every %~dp0 use after the shifts
+REM used to resolve to the FIRST ARGUMENT instead of the scripts folder, so
+REM `--no-keep-open` (the CI/automation flag) made BACKEND point one level too
+REM high ("...\GipfelBusinessCompetitionManagerWeb\..\backend") and the run
+REM aborted with "missing ...\..\backend\requirements.txt". %SCRIPT_DIR% is
+REM frozen here, while %0 is still this script, and used everywhere below.
+set "SCRIPT_DIR=%~dp0"
 
 REM --- keep the window open even if the script dies on a syntax error -----
 REM Audit X-18: the old guard used a GLOBAL ENV VAR as its "already re-entered"
@@ -49,10 +62,10 @@ if /i "%~1"=="__kept__" shift
 
 setlocal
 chcp 65001 >nul
-cd /d "%~dp0"
+cd /d "%SCRIPT_DIR%"
 
-set "BACKEND=%~dp0..\backend"
-set "FRONTEND=%~dp0..\frontend"
+set "BACKEND=%SCRIPT_DIR%..\backend"
+set "FRONTEND=%SCRIPT_DIR%..\frontend"
 set "SKIPFE=0"
 if /i "%~1"=="--skip-frontend" set "SKIPFE=1"
 
@@ -163,7 +176,7 @@ REM ---------- 3.5 LOGVIEWER_SECRET_KEY ----------
 REM LogViewer fails fast without it; generate a strong random key into backend\.env
 REM when empty (idempotent -- existing values are kept).
 echo [INFO]  Ensuring LOGVIEWER_SECRET_KEY in backend\.env ...
-"%PY%" "%~dp0gen_logviewer_key.py"
+"%PY%" "%SCRIPT_DIR%gen_logviewer_key.py"
 if errorlevel 1 (
   echo [ERROR] failed to ensure LOGVIEWER_SECRET_KEY
   goto :fail
@@ -211,7 +224,7 @@ echo    1. Start Django + Vite + LogViewer: scripts\start-dev.bat
 echo    2. Open http://localhost:5173 and login with admin / admin23
 echo       force-change on first login
 echo.
-cd /d "%~dp0"
+cd /d "%SCRIPT_DIR%"
 echo [TIP]  Press any key to close this window...
 pause
 exit /b 0
@@ -220,7 +233,7 @@ exit /b 0
 echo.
 echo [ERROR] Bootstrap FAILED. See messages above.
 echo.
-cd /d "%~dp0"
+cd /d "%SCRIPT_DIR%"
 echo [TIP]  Press any key to close this window...
 pause
 exit /b 1
