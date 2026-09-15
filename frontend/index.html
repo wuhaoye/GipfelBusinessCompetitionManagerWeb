@@ -2,7 +2,16 @@
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <!--
+      站点图标：由 src/assets/gipfel-logo.jpg 生成（只取上方**盾徽**，不含「Gipfel」字标——
+      字标在 16×16 标签页尺寸下不可读，留着只会让盾徽更小更糊）。
+      文件在 public/ 下，Vite 构建时原样拷到站点根目录。
+      ico 内含 16/32/48 三档，故 sizes="any" 让浏览器自行挑选。
+    -->
+    <link rel="icon" href="/favicon.ico" sizes="any" />
+    <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png" />
+    <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16.png" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="referrer" content="no-referrer" />
     <title>Gipfel 商赛办赛辅助系统</title>

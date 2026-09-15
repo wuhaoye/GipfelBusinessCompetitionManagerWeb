@@ -165,6 +165,27 @@ if _LV_URL:
     _p = _urlparse(_LV_URL)
     if _p.scheme and _p.netloc:
         CSRF_TRUSTED_ORIGINS.append(f"{_p.scheme}://{_p.netloc}")
+
+# ★ 兜底：把 ALLOWED_HOSTS 里的每个主机都补上 http / https 两种来源。
+#   为什么必须补：nginx 用 `proxy_set_header Host $host:$server_port` 透传，
+#   对【默认端口】会得到 log.example.com:80（或 :443），而浏览器发出的 Origin 会
+#   **省略默认端口**（http://log.example.com）。Django 的 _origin_verified 做的是
+#   **字符串相等**比较（见 django/middleware/csrf.py），于是对不上 → 落到
+#   allowed_origins_exact → 域名部署下该项若为空则登录 POST 直接 403。
+#   注意：非默认端口（如 :8120）浏览器会带端口、两边恰好一致——那段为 8120 修的
+#   逻辑没问题，但默认端口反而引入了新的差异，故此处按主机统一兜住两种 scheme。
+#   优先由 LOG_VIEWER_PUBLIC_URL 精确指定的来源仍保留在上面（更精确）。
+for _h in ALLOWED_HOSTS:
+    if not _h or _h.startswith(("*", ".")):
+        continue  # 通配条目无法拼成合法 origin，跳过
+    _bare = _h.strip("[]")
+    if ":" in _bare:
+        _bare = f"[{_bare}]"  # IPv6 必须加方括号才能拼成合法 origin（http://[::1]）
+    for _scheme in ("http", "https"):
+        _origin = f"{_scheme}://{_bare}"
+        if _origin not in CSRF_TRUSTED_ORIGINS:
+            CSRF_TRUSTED_ORIGINS.append(_origin)
+
 CSRF_TRUSTED_ORIGINS += [
     "http://127.0.0.1:8121",
     "https://127.0.0.1:8121",

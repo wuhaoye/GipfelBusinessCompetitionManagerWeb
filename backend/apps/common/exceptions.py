@@ -80,12 +80,20 @@ def _http_status(code: int) -> int:
 
 def _drf_message(exc, response) -> str:
     """DRF 默认异常 → 中文提示。"""
+    from rest_framework import exceptions as drf_exc
+
     status_code = response.status_code
     detail = getattr(exc, "detail", None)
 
     if status_code == 401:
-        # 优先采用后端明确提示（顶号）
-        if isinstance(detail, str) and detail != "Authentication credentials were not provided.":
+        # IsAuthenticated 权限拒绝（NotAuthenticated）：凭据缺失，统一给「登录已过期」
+        # 原写法比对英文 detail 字符串，USE_I18N=True + LANGUAGE_CODE=zh-hans 时
+        # DRF 抛出的已是中文「身份认证信息未提供。」，英文比对永假 → 中文原始消息直接泄露给用户。
+        # 改为比对异常类型，语言无关。
+        if isinstance(exc, drf_exc.NotAuthenticated):
+            return "登录已过期，请重新登录"
+        # AuthenticationFailed：后端主动抛出的明确提示（顶号/过期/改密），原样返回
+        if isinstance(detail, str):
             return detail
         return "登录已过期，请重新登录"
     if status_code == 403:

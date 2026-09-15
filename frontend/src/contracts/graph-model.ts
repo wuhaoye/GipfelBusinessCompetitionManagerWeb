@@ -481,7 +481,7 @@ export const PORT_HANDLE_TO_LABEL: Record<string, string> = Object.fromEntries(
 export const PORT_DESC: Record<string, string> = {
   entityRef: "选择要读取属性的数据管理实体（通常连输入项，提供实体 id）",
   multiplyByInput: "可选：再乘以某个输入项的数量",
-  key: "选择提供 key 的输入项",
+  key: "连接一个字符串源，作为字典键（如 CONST 字符串 / 另一个字典运算的输出）",
   value: "连接一个上游数值源，或直接填常量值",
   parent: "挂到某个控制流（IF / FOREACH / ASSIGN）之下，成为其分支 / 循环体 / 语句",
   party: "连接参与方节点，指定效果或检查作用于哪一方",
@@ -569,7 +569,7 @@ export const PORT_DESC: Record<string, string> = {
 export const PORT_TYPE: Record<string, string> = {
   entityRef: "实体ID",
   multiplyByInput: "数量",
-  key: "输入项",
+  key: "字符串",
   value: "常量/任意",
   routeRef: "节点列表",
   fieldParty: "参与方",
@@ -958,16 +958,11 @@ export function edgeTypeCheck(graph: GGraph, edge: GEdge): EdgeTypeCheck {
     };
   }
 
-  // 「输入键」端口：只接受输入项节点。
-  if (edge.targetHandle === "key") {
-    if (s.type === "input") return { ok: true, sourceType: sType, targetType: tType };
-    return {
-      ok: false,
-      sourceType: sType,
-      targetType: tType,
-      reason: "「输入键」端口只能连接到「输入项」节点",
-    };
-  }
+  // ★ 「输入键」端口（edge.targetHandle === "key"）：
+  //   原来硬限只接受 input 节点，现在改为按字符串类型走正常兼容判定（PORT_TYPE["key"] = "字符串"）。
+  //   字典运算（DICT_GET / DICT_HAS_KEY / DICT_APPEND）的 key 是字典键，语义上是字符串，
+  //   不限于 input 节点——也可接 CONST 或其它输出字符串的节点。
+  //   硬限删除后，走下方 typeAccepts("字符串", sType) 即可（对一切类型放行）。
 
   // 任意类型豁免（两端任一为任意/待定，不报错）。
   if (

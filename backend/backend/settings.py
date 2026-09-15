@@ -459,6 +459,20 @@ LOGGING = {
 }
 
 
-# ==================== Session/Cookie（API 项目基本不用，保留默认） ====================
+# ==================== 反向代理 / HTTPS ====================
+# nginx 终止 TLS 后以 http 反代到 daphne(127.0.0.1:8000)，并转发
+# X-Forwarded-Proto（见 deploy/nginx-gipfel.conf 各 proxy_set_header）。
+# 不声明此项时 Django 的 request.is_secure() 恒为 False：admin 会话与 CSRF
+# cookie 不会被标记 Secure，request.build_absolute_uri() 也会生成 http:// 链接。
+# 与日志查看器站点保持一致（backend/logviewer/logviewer/settings.py 同名设置）。
+#
+# 安全性：daphne 仅绑回环地址，公网无法直接投递该头，故信任它是安全的。
+SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+
+# ==================== Session/Cookie ====================
 SESSION_COOKIE_HTTPONLY = True
 CSRF_COOKIE_HTTPONLY = True
+# SESSION_COOKIE_SECURE / CSRF_COOKIE_SECURE 暂不在此无条件开启：
+# 纯 HTTP 部署下标记 Secure 会导致 cookie 无法回传、admin 登录失败。
+# 如需开启，请参照日志查看器按「外网地址是否为 https」条件设置
+# （LOGVIEWER_SECURE_COOKIES 的同类做法），而不是硬编码 True。

@@ -285,7 +285,31 @@ async function openLogViewer() {
     const res = (await api.post("/auth/logviewer-token")) as { token?: string };
     const token = res?.token;
     if (!token) throw new Error("未获取到访问令牌");
-    const base = `http://${window.location.hostname}:${versionStore.logViewerPort || 8120}/`;
+
+    // ★ 优先用后端下发的 log_viewer_url（/api/version）。
+    //   它已考虑 LOG_VIEWER_PUBLIC_URL 显式覆盖，以及三种部署形态：
+    //     · 子域：      https://log.<域名>/
+    //     · 非标准端口：https://<域名>:8443/   （CF 只代理固定端口，8120 不在其中）
+    //     · 纯 IP：     http://<IP>:8120/
+    //   此处**现取**而不用 versionStore 里的缓存值：该字段只对已登录用户返回，
+    //   而 store 的 checkVersion() 在登录前就已执行过，缓存到的会是 undefined。
+    let base = "";
+    try {
+      const v = await api.get<{ log_viewer_url?: string }>("/version");
+      base = (v?.log_viewer_url || "").trim();
+    } catch {
+      /* 取不到则走下面的回退 */
+    }
+
+    if (!base) {
+      // 回退（仅在拿不到后端地址时使用）：按当前页面协议 + 主机名 + 端口推导。
+      // 注意：此处过去**写死了 http://**，HTTPS 部署下会生成不可达地址；
+      // 现改为跟随页面协议。带端口的形态仅在「同机、该端口对外可达」时成立。
+      const scheme = window.location.protocol === "https:" ? "https:" : "http:";
+      const port = versionStore.logViewerPort || 8120;
+      base = `${scheme}//${window.location.hostname}:${port}/`;
+    }
+
     const sep = base.includes("?") ? "&" : "?";
     const url = `${base}${sep}token=${encodeURIComponent(token)}`;
     window.open(url, "_blank", "noopener,noreferrer");

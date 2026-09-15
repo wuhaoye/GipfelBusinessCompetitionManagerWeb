@@ -20,6 +20,27 @@ set -euo pipefail
 # 需要交互的场景（手动填写公网 IP）已在脚本内用显式 read < /dev/stdin 处理。
 exec 0</dev/null
 
+# ---------------- 失败时必须说清「停在哪一行」 ----------------
+# 背景：`set -e` 失败时**不输出任何东西**，表现为脚本「跑一半就没了」，运维无法判断
+# 停在哪一步、该手工补哪一步（升级脚本上已真实发生一次）。故装 ERR trap 打出定位信息。
+# 触发条件与 set -e 一致（if/while 条件、&&/|| 列表、! 取反不触发）。
+# 本 trap 不继承进函数体（未开 set -E，避免改变控制流的风险），覆盖顶层命令。
+__on_err() {
+    local rc="$1" line="$2" cmd="$3"
+    {
+        echo ""
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "[FAIL] 脚本在第 ${line} 行终止（退出码 ${rc}）"
+        echo "       命令：${cmd}"
+        echo ""
+        echo "       已完成步骤的成果保留生效；修好后可直接重跑本脚本（幂等）。"
+        echo "       若是 grep「无匹配」导致：属脚本缺陷（该处应容忍无匹配），请反馈上面两行。"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    } >&2
+    exit "$rc"
+}
+trap '__on_err $? "$LINENO" "$BASH_COMMAND"' ERR
+
 # 输出助手必须先于参数清洗定义：非法 DOMAIN 检查会调用 warn，
 # set -e 下未定义命令返回 127 会直接终止脚本。
 log()   { printf "\033[36m[INFO]\033[0m %s\n" "$*"; }
@@ -69,6 +90,14 @@ PUBLIC_IP_SET=0  # 标记 --public-ip 是否由用户显式传入（用于结尾
 # 拿到日志的人就能在管理员首次登录前直接以 admin 接管系统。默认不再打印。
 PRINT_SEED_PASSWORD=0
 LV_PUBLIC_IP=""  # 预初始化：set -u 下 DJANGO_ALLOWED_HOSTS 自愈块可能在其未赋值时引用（如 .env 已存在且无需纠正）
+# HTTPS via Cloudflare Origin Certificate（--origin-cert）
+ORIGIN_CERT=0                          # 1 = 在 vhost 中启用 443 块并填入证书路径
+ORIGIN_CERT_DIR="/etc/ssl/cloudflare"  # 证书目录；文件名按 <DIR>/<域名>.pem|.key 推导
+SSL_CERT=""                            # 显式覆盖证书路径（--ssl-cert），空则按域名推导
+SSL_KEY=""                             # 显式覆盖私钥路径（--ssl-key）
+# 日志查看器：域名 + 非标准 TLS 端口（Cloudflare 代理自定义端口形态，--logviewer-tls-port）
+LOGVIEWER_TLS_PORT=""                  # 例："8443"；非空则渲染该端口块并写 LOG_VIEWER_PUBLIC_URL
+LOGVIEWER_TLS_PORT_SET=0               # 用户是否显式指定过（--logviewer-tls-port / --no-logviewer-tls）
 
 usage() {
     cat <<EOF
@@ -78,6 +107,18 @@ Usage: $0 [options]
   --public-ip IP               公网 IP（无 --domain 部署时日志查看器使用 http://<IP>:${LV_PORT:-8120}/）；
                               显式传入可跳过自动探测与交互填写，避免受限网络/非交互环境卡住
   --with-nginx                 配置 nginx 虚拟主机
+  --origin-cert                启用 HTTPS，用 Cloudflare Origin Certificate（需同时给 --domain）。
+                              脚本会取消 vhost 里 443 模板的注释并填入证书路径，然后 nginx -t + reload。
+                              证书默认取 <--origin-cert-dir>/<域名>.pem 与 .key
+  --origin-cert-dir PATH       证书目录，默认 /etc/ssl/cloudflare
+  --ssl-cert PATH              显式指定证书文件（覆盖按域名推导）
+  --ssl-key PATH               显式指定私钥文件（覆盖按域名推导）
+  --logviewer-tls-port PORT    日志查看器的 HTTPS 端口。**--origin-cert 时默认 8443**，通常无需手传。
+                               CF 只代理固定端口（HTTPS 443/2053/2083/2087/2096/8443），
+                               而默认的 8120 不在其中，故 http://<域名>:8120/ 永远连不上。
+                               脚本会把 LOG_VIEWER_PUBLIC_URL 写成 https://<域名>:PORT/
+                               另需在云安全组入方向放行该 TCP 端口。
+  --no-logviewer-tls           关闭上述端口块（用于改用 log.<域名> 子域形态的部署）
   --skip-install-deps          跳过 apt install（已知环境已装好）
   --force-overwrite            即使 INSTALL_DIR 存在也覆盖（保留 backup）
   --print-seed-password        在**交互终端**（stdout 为 TTY）上显示初始管理员口令；
@@ -94,6 +135,12 @@ while [[ $# -gt 0 ]]; do
         --install-dir)        INSTALL_DIR="$2"; shift 2 ;;
         --public-ip)          PUBLIC_IP="$2"; PUBLIC_IP_SET=1; shift 2 ;;
         --with-nginx)         WITH_NGINX=1; shift ;;
+        --origin-cert)        ORIGIN_CERT=1; shift ;;
+        --origin-cert-dir)    ORIGIN_CERT_DIR="$2"; ORIGIN_CERT=1; shift 2 ;;
+        --ssl-cert)           SSL_CERT="$2"; ORIGIN_CERT=1; shift 2 ;;
+        --ssl-key)            SSL_KEY="$2"; ORIGIN_CERT=1; shift 2 ;;
+        --logviewer-tls-port) LOGVIEWER_TLS_PORT="$2"; LOGVIEWER_TLS_PORT_SET=1; shift 2 ;;
+        --no-logviewer-tls)   LOGVIEWER_TLS_PORT="";   LOGVIEWER_TLS_PORT_SET=1; shift ;;
         --skip-install-deps)  SKIP_INSTALL_DEPS=1; shift ;;
         --force-overwrite)    FORCE_OVERWRITE=1; shift ;;
         --print-seed-password) PRINT_SEED_PASSWORD=1; shift ;;
@@ -102,6 +149,15 @@ while [[ $# -gt 0 ]]; do
         *) echo "未知参数 $1"; usage; exit 2 ;;
     esac
 done
+
+# ★ 日志查看器 TLS 端口的默认值：**默认 8443**。
+#   只在 --origin-cert（=域名走 Cloudflare）时生效——因为该默认值的前提是「前置 CDN 只代理
+#   固定端口」，而 8443 恰在 CF 的 HTTPS 端口白名单里（8120 不在）。非 CF 的部署（certbot
+#   路线）不该被自动开一个额外端口，故此时保持关闭。
+#   显式传 --logviewer-tls-port <端口> 或 --no-logviewer-tls 均会覆盖此默认。
+if [[ "$LOGVIEWER_TLS_PORT_SET" != 1 && "$ORIGIN_CERT" == 1 ]]; then
+    LOGVIEWER_TLS_PORT="8443"
+fi
 
 # 输入清洗：移除会破坏 sed 替换 / 正则 / nginx 配置注入的元字符（& \ /）。
 # DOMAIN 仅允许主机名合法字符，PUBLIC_IP 仅允许 IP 合法字符，二者均不含上述元字符。
@@ -401,7 +457,9 @@ log "日志查看器公网监听端口：${LV_PORT}（daphne 内部仍绑 8121�
 # 公网 IP 探测失败则移除该行，改由后端按请求 Host 推导（nginx 透传 $host=公网 IP），
 # 避免内网 IP 持续生效。
 if [[ -z "$DOMAIN" && -f "$INSTALL_DIR/backend/.env" ]]; then
-    LV_CUR="$(grep -E '^LOG_VIEWER_PUBLIC_URL=' "$INSTALL_DIR/backend/.env" | tail -n1 | sed -E 's#^LOG_VIEWER_PUBLIC_URL=https?://##; s#[/:].*##')"
+    # ★ 整条管道必须容忍「无匹配」：.env 里没有该行时 grep 退出 1，set -o pipefail 下
+    #   整条管道失败；而这行是**变量赋值**，退出码即命令替换的退出码 → set -e 静默终止脚本。
+    LV_CUR="$(grep -E '^LOG_VIEWER_PUBLIC_URL=' "$INSTALL_DIR/backend/.env" | tail -n1 | sed -E 's#^LOG_VIEWER_PUBLIC_URL=https?://##; s#[/:].*##' || true)"
     LV_NEED_FIX=0
     if [[ -n "$PUBLIC_IP" ]]; then
         LV_NEED_FIX=1   # 显式指定：强制以 --public-ip 为准（覆盖内网 IP 或缺失行）
@@ -454,10 +512,15 @@ fi
 #   缺失时 Django 对一切非回环 Host 的请求返回原生 400 Bad Request（登录/健康检查
 #   全部失败，前端表现为「请求参数错误」）。幂等：白名单里已有该条目则不重复追加。
 #   优先顺序：--domain > --public-ip > 自动探测公网 IP。
+#   ★ 域名模式下必须**同时**加入 log.<DOMAIN>：日志查看器是独立 Django 服务，它自己的
+#     ALLOWED_HOSTS 靠本项兜底纳入（见 backend/logviewer/logviewer/settings.py 读取
+#     DJANGO_ALLOWED_HOSTS 的那段）。少了这个子域，nginx 以 Host: log.<域名> 反代过去
+#     会被日志查看器以 400 拒绝——现象是「域名部署后主站正常、日志查看器打不开」，
+#     很难联想到是 Host 头白名单问题。
 if [[ -f "$INSTALL_DIR/backend/.env" ]]; then
-    AH_ENTRY=""
+    AH_ENTRIES=()
     if [[ -n "$DOMAIN" ]]; then
-        AH_ENTRY="$DOMAIN"
+        AH_ENTRIES+=("$DOMAIN" "log.$DOMAIN")
     else
         if [[ -z "$LV_PUBLIC_IP" && -n "$PUBLIC_IP" ]]; then
             LV_PUBLIC_IP="$(normalize_ip "$PUBLIC_IP")"
@@ -466,17 +529,64 @@ if [[ -f "$INSTALL_DIR/backend/.env" ]]; then
             LV_PUBLIC_IP="$(_probe_public_ip)" || true
             [[ -n "$LV_PUBLIC_IP" ]] && LV_PUBLIC_IP="$(normalize_ip "$LV_PUBLIC_IP")"
         fi
-        AH_ENTRY="$LV_PUBLIC_IP"
+        if [[ -n "$LV_PUBLIC_IP" ]]; then
+            AH_ENTRIES+=("$LV_PUBLIC_IP")
+        fi
     fi
-    if [[ -n "$AH_ENTRY" ]]; then
-        # 审计 X-11：改前用 `sed "s|^DJANGO_ALLOWED_HOSTS=.*|&,${AH_ENTRY}|"` 追加 ——
-        # `&` 是整行匹配文本，公网 IP 变化就会反复追加（历史 IP 永久留在 Host 白名单里），
-        # 且同名键多行时会被同时改写（os.environ 只认第一条）。现在改为「去重合并 + 唯一行」。
-        _ah_value="$(append_env_entry "$INSTALL_DIR/backend/.env" "DJANGO_ALLOWED_HOSTS" \
-            "$AH_ENTRY" "localhost,127.0.0.1")"
-        ok "DJANGO_ALLOWED_HOSTS 已写入（唯一一行）：${_ah_value}"
+    if [[ ${#AH_ENTRIES[@]} -gt 0 ]]; then
+        if grep -q '^DJANGO_ALLOWED_HOSTS=' "$INSTALL_DIR/backend/.env"; then
+            for _ah in "${AH_ENTRIES[@]}"; do
+                if ! grep -E "^DJANGO_ALLOWED_HOSTS=" "$INSTALL_DIR/backend/.env" | grep -qE "(^|,)${_ah}(,|$)"; then
+                    sed -i "s|^DJANGO_ALLOWED_HOSTS=.*|&,${_ah}|" "$INSTALL_DIR/backend/.env"
+                    ok "DJANGO_ALLOWED_HOSTS 已追加公网入口：${_ah}"
+                fi
+            done
+        else
+            _ah_new="$(IFS=,; echo "${AH_ENTRIES[*]}")"
+            echo "DJANGO_ALLOWED_HOSTS=${_ah_new},localhost,127.0.0.1" >> "$INSTALL_DIR/backend/.env"
+            ok "DJANGO_ALLOWED_HOSTS 已写入：${_ah_new},localhost,127.0.0.1"
+        fi
     else
         warn "未能确定公网入口（域名/公网 IP 均为空），DJANGO_ALLOWED_HOSTS 未修改；若经公网访问出现 400，请手动在 backend/.env 加入 DJANGO_ALLOWED_HOSTS=<公网IP>,localhost"
+    fi
+
+    # ---- 域名形态：脚本统一决定日志查看器公网地址（自动，无需人工改 .env）----
+    #   · 有 --logviewer-tls-port（--origin-cert 时默认 8443）→ https://<域名>:<端口>/
+    #   · 否则（log.<域名> 子域形态）                        → https://log.<域名>/
+    #
+    # 为什么由脚本写死，而不是留给后端按请求 Host 推导：
+    #   /api/version 的逻辑是「优先用 LOG_VIEWER_PUBLIC_URL，没有才按 Host 推导」。两处都可能错：
+    #     · .env 里残留早期无域名部署写入的 http://<公网IP>:8120/ → 按钮永远指向它（真实故障）
+    #     · Host 若为 IP（如用 IP 访问页面）→ 推导出 http://<IP>:8120/，在 CF 代理下必然打不开
+    #   显式写死之后只有一个权威值，且脚本收尾能自检（见文件末尾「部署自检」）。
+    #
+    # 为什么换端口：CF 只代理固定端口（HTTP 80/8080/8880/2052/2082/2086/2095，
+    #   HTTPS 443/2053/2083/2087/2096/8443），默认 8120 不在其中。
+    if [[ -n "$DOMAIN" ]]; then
+        if [[ -n "$LOGVIEWER_TLS_PORT" ]]; then
+            if [[ ! "$LOGVIEWER_TLS_PORT" =~ ^[0-9]+$ ]] \
+               || (( LOGVIEWER_TLS_PORT < 1 || LOGVIEWER_TLS_PORT > 65535 )); then
+                err "--logviewer-tls-port 需为 1-65535 的整数，收到：${LOGVIEWER_TLS_PORT}"
+            fi
+            if [[ "$ORIGIN_CERT" != 1 ]]; then
+                err "--logviewer-tls-port 需要与 --origin-cert 一起使用（该端口块本身要 TLS 证书，否则按钮会指向一个没人监听的端口）"
+            fi
+            _lv_url="https://${DOMAIN}:${LOGVIEWER_TLS_PORT}/"
+        else
+            _lv_url="https://log.${DOMAIN}/"
+        fi
+        # 先删后加：幂等，且不受「行不存在时 sed 空操作」影响（曾因此静默无效）
+        sed -i -E '/^LOG_VIEWER_PUBLIC_URL=/d' "$INSTALL_DIR/backend/.env"
+        echo "LOG_VIEWER_PUBLIC_URL=${_lv_url}" >> "$INSTALL_DIR/backend/.env"
+        ok "LOG_VIEWER_PUBLIC_URL=${_lv_url}（前端「日志查看器」按钮将指向它）"
+
+        if [[ -n "$LOGVIEWER_TLS_PORT" ]]; then
+            warn "别忘了在**云安全组**入方向放行 TCP ${LOGVIEWER_TLS_PORT}（脚本只能放行本机 ufw，管不到云侧）。"
+        elif ! getent hosts "log.${DOMAIN}" >/dev/null 2>&1; then
+            # 子域形态的自动前置检查：没有 DNS 记录时按钮必然打不开，这里直接说清
+            warn "log.${DOMAIN} 解析不到（无 DNS 记录）——日志查看器按钮将打不开。"
+            warn "  若无法添加该三级记录，请改用 --origin-cert（TLS 端口默认 8443，不需要该子域）。"
+        fi
     fi
 fi
 
@@ -615,6 +725,114 @@ if [[ $WITH_NGINX -eq 1 ]]; then
         sed -i '/# === LOGVIEWER_SUBDOMAIN_START ===/,/# === LOGVIEWER_SUBDOMAIN_END ===/d' "$VHOST_FILE"
     fi
 
+    # ---------------- HTTPS：启用 443（Cloudflare Origin Certificate）----------------
+    # 模板中的 443 块默认是**注释态**（保证未启用时 nginx -t 恒通过）。本段按 --origin-cert
+    # 取消注释并填入证书路径。为什么提供这条路：Let's Encrypt 的 HTTP-01 要为每个 -d 名字
+    # 做校验，log.<DOMAIN> 没有 DNS 记录时 certbot 会**整体中止**、443 块一个字节都写不进去
+    # （真实的 521 事故根因）；Origin Certificate 由 Cloudflare 直接签发，不依赖 DNS 校验。
+    # ⚠️ 走 certbot 的用户**不要**加 --origin-cert：certbot 会自己写 443 块，两者会让同一
+    #    server_name 出现两个 443 块（nginx 报 conflicting server name 并只用一个）。
+    if [[ "$ORIGIN_CERT" == 1 ]]; then
+        if [[ "$WITH_NGINX" != 1 ]]; then
+            err "--origin-cert 需要与 --with-nginx 一起使用（否则没有可改写的 vhost）"
+        fi
+        if [[ -z "$DOMAIN" ]]; then
+            err "--origin-cert 需要同时传 --domain（默认用它推导证书文件名 <目录>/<域名>.pem|.key；
+     如需自定义路径请用 --ssl-cert / --ssl-key）"
+        fi
+        # 路径：显式 --ssl-cert/--ssl-key 优先，否则按 <DIR>/<域名>.pem|.key 推导
+        [[ -n "$SSL_CERT" ]] || SSL_CERT="${ORIGIN_CERT_DIR}/${DOMAIN}.pem"
+        [[ -n "$SSL_KEY"  ]] || SSL_KEY="${ORIGIN_CERT_DIR}/${DOMAIN}.key"
+        for _f in "$SSL_CERT" "$SSL_KEY"; do
+            if [[ ! -s "$_f" ]]; then
+                err "证书文件不存在或为空：$_f
+  请先在 Cloudflare 面板「SSL/TLS → 源服务器 → 创建证书」签发，
+  Hostnames 填 ${DOMAIN} 与 log.${DOMAIN}（或 *.${DOMAIN}），然后把两个文件放好：
+    sudo install -d -m 755 ${ORIGIN_CERT_DIR}
+    sudo install -m 644 <下载的 cert.pem> ${ORIGIN_CERT_DIR}/${DOMAIN}.pem
+    sudo install -m 600 <下载的 key.pem>  ${ORIGIN_CERT_DIR}/${DOMAIN}.key
+  私钥只需 root 可读（nginx master 以 root 读取），故 600 即可。"
+            fi
+        done
+        # ① 主站 443 块：取消整段注释（标记行本身保持注释，便于重复运行）
+        sed -i -E "/^# === NGINX_SSL_443_START ===$/,/^# === NGINX_SSL_443_END ===$/ { /^# === NGINX_SSL/! { s/^# //; s/^#$// } }" "$VHOST_FILE"
+        # ② 日志查看器子域 443 块：同理。少了它，前端按钮指向的 https://log.<域名>/ 无人应答
+        sed -i -E "/^# === NGINX_SSL_443_LOGVIEWER_START ===$/,/^# === NGINX_SSL_443_LOGVIEWER_END ===$/ { /^# === NGINX_SSL/! { s/^# //; s/^#$// } }" "$VHOST_FILE"
+        # ②b 日志查看器「域名 + 非标准 TLS 端口」块（--logviewer-tls-port）
+        #     为什么单列一块：域名走 Cloudflare 时 CF 只代理固定端口，默认 8120 不在其中，
+        #     而 log.<域名> 又可能加不了记录 —— 于是用同一主机名的 CF 受支持端口（8443）。
+        if [[ -n "$LOGVIEWER_TLS_PORT" ]]; then
+            sed -i -E "/^# === LOGVIEWER_TLS_PORT_START ===$/,/^# === LOGVIEWER_TLS_PORT_END ===$/ { /^# === LOGVIEWER_TLS/! { s/^# //; s/^#$// } }" "$VHOST_FILE"
+        else
+            # 未启用：整段删除，避免留下 __LOG_VIEWER_TLS_PORT__ 占位符导致 nginx -t 失败
+            sed -i '/^# === LOGVIEWER_TLS_PORT_START ===$/,/^# === LOGVIEWER_TLS_PORT_END ===$/d' "$VHOST_FILE"
+        fi
+        # ③ 填入证书路径与端口
+        #   ★ 这一步必须**先于下面所有检查**：检查的是「替换完成后的最终产物」。
+        #     曾把 `grep 'listen <端口> ssl'` 放在端口替换之前 → 那一刻产物里还是
+        #     `listen __LOG_VIEWER_TLS_PORT__ ssl;`，grep 必然失败并误报「模板被改动」。
+        sed -i -e "s|__SSL_CERT__|${SSL_CERT}|g" -e "s|__SSL_KEY__|${SSL_KEY}|g" "$VHOST_FILE"
+        if [[ -n "$LOGVIEWER_TLS_PORT" ]]; then
+            sed -i "s|__LOG_VIEWER_TLS_PORT__|${LOGVIEWER_TLS_PORT}|g" "$VHOST_FILE"
+        fi
+        # ④ 防御：残留占位符说明模板与脚本版本撕裂，此时 nginx -t 必然失败，提前给可读错误
+        if grep -q '__SSL_CERT__\|__SSL_KEY__\|__LOG_VIEWER_TLS_PORT__' "$VHOST_FILE"; then
+            err "vhost 仍残留占位符（__SSL_CERT__/__SSL_KEY__/__LOG_VIEWER_TLS_PORT__），模板与脚本版本不一致；请把 deploy/nginx-gipfel.conf 与 scripts/ 同步到同一 commit 后重跑"
+        fi
+        # ⑤ 自检：确认各 443/TLS 块真的进了产物（在占位符全部替换之后判断）
+        if ! grep -q 'listen 443 ssl' "$VHOST_FILE"; then
+            err "已在 --origin-cert 模式下渲染，但产物里没有 listen 443 ssl —— 模板的 SSL 标记可能被改动，请检查 deploy/nginx-gipfel.conf"
+        fi
+        if [[ -n "$LOGVIEWER_TLS_PORT" ]] \
+           && ! grep -qE "^[[:space:]]*listen[[:space:]]+${LOGVIEWER_TLS_PORT}[[:space:]]+ssl;" "$VHOST_FILE"; then
+            err "已请求 --logviewer-tls-port ${LOGVIEWER_TLS_PORT}，但产物里没有 'listen ${LOGVIEWER_TLS_PORT} ssl;' —— 模板的 LOGVIEWER_TLS_PORT 标记可能被改动，请检查 deploy/nginx-gipfel.conf"
+        fi
+        # ⑥ 自检：区域内若混入「散文注释」，取消一层注释后会变成非法指令。
+        #   曾真实发生：unknown directive "日志查看器子域的" —— nginx 的报错不会说明
+        #   是模板问题，运维很难定位，故提前用可读错误拦住。
+        #   注意必须先 `sed 's/#.*$//'` 剥掉**行内注释**再判断：模板里存在合法行内注释
+        #   （如 `proxy_read_timeout 86400s;   # 长连接`），只看行首会把它误判成散文。
+        _bad_prose="$(LC_ALL=C sed 's/#.*$//' "$VHOST_FILE" 2>/dev/null \
+                      | LC_ALL=C grep -n '[^ -~]' | head -3 || true)"
+        if [[ -n "$_bad_prose" ]]; then
+            err "渲染后的 vhost 出现「生效的非 ASCII 行」——SSL 标记区域内混入了散文注释（或行内注释前的指令含非 ASCII）：
+${_bad_prose}
+  NGINX_SSL_443* 区域内只允许放【注释形式的 nginx 配置】；说明文字必须写在标记行之外。
+  区域内确需写注释时用两层井号（\`#     # 说明\`），取消一层后仍是注释。"
+        fi
+        ok "已启用 HTTPS：证书 ${SSL_CERT}；服务 ${DOMAIN} 与 log.${DOMAIN}（443）"
+    fi
+
+    # ★ 防「静默摧毁 HTTPS」+ 留可回滚副本。
+    #   下一行会用模板产物**整体覆盖** vhost；而 certbot 的 nginx 插件是把 443 块
+    #   **直接写进同一个文件**的。若现有 vhost 已含生效的 443，而本次没有 --origin-cert
+    #   去重新生成它，覆盖后 443 就消失、HTTPS 静默失效（全程无任何报错）。
+    if [[ -f /etc/nginx/sites-available/gipfel.conf ]]; then
+        cp -f /etc/nginx/sites-available/gipfel.conf \
+              "/etc/nginx/sites-available/gipfel.conf.bak-$(date +%F_%H%M%S)" 2>/dev/null || true
+        if [[ "$ORIGIN_CERT" != 1 ]] \
+           && grep -qE '^[[:space:]]*listen[[:space:]]+443' /etc/nginx/sites-available/gipfel.conf; then
+            err "现有 vhost 已配置 443，而本次未传 --origin-cert——覆盖会让 HTTPS 配置消失（且不报错）。
+    请二选一：
+      A) 改由脚本管理 HTTPS：把证书放到 ${ORIGIN_CERT_DIR}/<域名>.pem|.key，加 --origin-cert 重跑；
+      B) 继续由 certbot 管理：本次**不要加 --with-nginx**（只升级代码与服务），
+         或先把 443 块移到 /etc/nginx/snippets/ 下再用 include 引入。
+    旧 vhost 已备份为 /etc/nginx/sites-available/gipfel.conf.bak-<时间戳>，可随时还原。"
+        fi
+        # 同类防护（日志查看器非标准 TLS 端口）：若现有 vhost 已在 8443 之类的端口上提供
+        # TLS，而本次未传 --logviewer-tls-port，覆盖后该块会消失 —— 前端按钮随即指向空气。
+        # 注意必须带 || true：管道里首个 grep 无匹配会退出 1，pipefail 下会让赋值失败并终止脚本。
+        _stale_tls_ports="$(grep -oE '^[[:space:]]*listen[[:space:]]+[0-9]+[[:space:]]+ssl' \
+                              /etc/nginx/sites-available/gipfel.conf 2>/dev/null \
+                            | grep -oE '[0-9]+' | grep -v '^443$' | sort -u | tr '\n' ' ' || true)"
+        if [[ -z "$LOGVIEWER_TLS_PORT" && -n "$_stale_tls_ports" ]]; then
+            err "现有 vhost 已在非标准端口上提供 TLS（端口：${_stale_tls_ports}），而本次未传 --logviewer-tls-port——
+    覆盖后这些端口块会消失，日志查看器可能因此打不开（且不报错）。
+    若确实在用，请带上 --logviewer-tls-port <端口> 重跑；
+    若有意移除，请手动确认后再执行（旧 vhost 已备份）。"
+        fi
+    fi
+
     cp -f "$VHOST_FILE" /etc/nginx/sites-available/gipfel.conf
     rm -f "$_tmp_vhost"
 
@@ -713,13 +931,48 @@ if [[ $WITH_NGINX -eq 1 ]]; then
         fi
     fi
 
-    if [[ -n "$DOMAIN" ]]; then
-        if command -v certbot >/dev/null 2>&1; then
-            warn "已安装 certbot，可手动执行：certbot --nginx -d $DOMAIN -d log.$DOMAIN --non-interactive --redirect"
+    # 80/443 放行：nginx 接管 80 是必然的；443 在启用 HTTPS 后必需。
+    #   本脚本**不自动申请证书**（未确认 DNS / 安全组就中途跑 certbot，失败时会把
+    #   nginx 留在半配置状态），所以这里先把 443 一并放行，让后续
+    #   `certbot --nginx ...` 一步到位即生效、无需再回来改防火墙。
+    #   ⚠️ 放行的是「源站」。若域名前面挂了 Cloudflare 等 CDN，CDN 回源同样要能连上
+    #      443，否则 CDN 侧报 521（Web server is down，含义是连不上源站）。
+    #      详见 deploy/README.md 的「Cloudflare / CDN 前置」一节。
+    if command -v ufw >/dev/null 2>&1; then
+        ufw allow 80/tcp  >/dev/null 2>&1 || true
+        ufw allow 443/tcp >/dev/null 2>&1 || true
+        if [[ -n "$LOGVIEWER_TLS_PORT" ]]; then
+            ufw allow "${LOGVIEWER_TLS_PORT}/tcp" >/dev/null 2>&1 || true
+            ok "已放行防火墙 80/443/${LOGVIEWER_TLS_PORT} 端口（若 ufw 未启用则该规则暂未生效）"
         else
-            warn "如需 HTTPS：apt-get install -y certbot python3-certbot-nginx && certbot --nginx -d $DOMAIN -d log.$DOMAIN --redirect"
+            ok "已放行防火墙 80/443 端口（若 ufw 未启用则该规则暂未生效）"
         fi
-        warn "另需：将 log.$DOMAIN 的 DNS A 记录指向本服务器（日志查看器子域代理前置条件）。"
+    else
+        if [[ -n "$LOGVIEWER_TLS_PORT" ]]; then
+            warn "请确认云/系统防火墙放行 TCP 80、443 与 ${LOGVIEWER_TLS_PORT}，否则 HTTPS / 日志查看器不可达。"
+        else
+            warn "请确认云/系统防火墙放行 TCP 80 与 443，否则 HTTPS 不可达（经 CDN 回源时报 521）。"
+        fi
+    fi
+
+    if [[ -n "$DOMAIN" ]]; then
+        if [[ "$ORIGIN_CERT" == 1 ]]; then
+            # 已用 Origin Certificate 启用 443：不要再引导去跑 certbot（会重复 443 块）
+            ok "HTTPS 已按 Cloudflare Origin Certificate 启用（无需 certbot，也请勿再对其执行 --nginx 签发）"
+            warn "仍需确认：① Cloudflare SSL/TLS 模式为 Full (strict)；② log.$DOMAIN 的 DNS 记录已存在"
+            warn "  （Origin Certificate 不校验 DNS，所以证书能装上，但访客解析不到 log.$DOMAIN 依然打不开日志查看器）。"
+            warn "  证书有效期最长 15 年，到期前在 CF 面板重新签发并替换两个文件后重跑本脚本即可。"
+        elif command -v certbot >/dev/null 2>&1; then
+            warn "已安装 certbot，可手动执行：certbot --nginx -d $DOMAIN --non-interactive --redirect"
+        else
+            warn "如需 HTTPS：apt-get install -y certbot python3-certbot-nginx && certbot --nginx -d $DOMAIN --redirect"
+        fi
+        if [[ "$ORIGIN_CERT" != 1 ]]; then
+            warn "另需：将 log.$DOMAIN 的 DNS A 记录指向本服务器（日志查看器子域代理前置条件）。"
+            warn "★ 先只签主域。加 -d log.$DOMAIN 时若该子域无 DNS 记录，certbot 会整体中止、443 块写不进去。"
+            warn "  若必须一次覆盖两个名字，改用 Cloudflare Origin Certificate：--origin-cert（不依赖 DNS 校验）。"
+            warn "Cloudflare 代理场景：SSL/TLS 模式须为 Full (strict)，切勿用 Flexible（与 --redirect 叠加会变成重定向循环）。见 deploy/README.md。"
+        fi
     else
         # 无域名：日志查看器经 ${LV_PORT} 端口暴露公网（取自 .env LOG_VIEWER_PORT），
         # 需放行防火墙
@@ -750,16 +1003,12 @@ else
 fi
 echo
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-# 审计 X-22：改前这里无条件把 .env 里的 SEED_ADMIN_PASSWORD 明文回显到 stdout。
-# 现在只有「显式 --print-seed-password 且 stdout 是终端」才显示，其余情况给查看命令。
-echo "  👤 管理员账号：admin"
-if [[ "$PRINT_SEED_PASSWORD" == "1" && -t 1 ]]; then
-    _SEED_PW="$(grep -E '^SEED_ADMIN_PASSWORD=' "$INSTALL_DIR/backend/.env" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]' | sed -E "s/^['\"]//; s/['\"]$//")"
-    if [[ -n "$_SEED_PW" ]]; then
-        echo "  🔑 管理员密码：${_SEED_PW}"
-    else
-        echo "  🔑 管理员密码：admin23（默认值，建议登录后立即修改）"
-    fi
+# 读取管理员密码并醒目输出（★ 必须容忍无匹配：首次部署 .env 尚未写入该行时 grep 退出 1，
+#   pipefail 下会让这行赋值失败 → set -e 在脚本最后一步静默终止，看不到任何凭据输出）
+_SEED_PW="$(grep -E '^SEED_ADMIN_PASSWORD=' "$INSTALL_DIR/backend/.env" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]' | sed -E "s/^['\"]//; s/['\"]$//" || true)"
+if [[ -n "$_SEED_PW" ]]; then
+    echo "  👤 管理员账号：admin"
+    echo "  🔑 管理员密码：${_SEED_PW}"
 else
     echo "  🔑 管理员密码：见 ${INSTALL_DIR}/backend/.env 的 SEED_ADMIN_PASSWORD"
     echo "     查看命令：sudo grep '^SEED_ADMIN_PASSWORD=' ${INSTALL_DIR}/backend/.env"
@@ -786,9 +1035,13 @@ fi
 echo "  目录：        $INSTALL_DIR"
 echo "  后端状态：    systemctl status gipfel"
 if [[ $WITH_NGINX -eq 1 ]]; then
-    SERVER_IP="$(hostname -I | awk '{print $1}')"
+    SERVER_IP="$(hostname -I | awk '{print $1}' || true)"
     if [[ -n "$DOMAIN" ]]; then
-        echo "  网站(公网)：   http://${DOMAIN}/"
+        if [[ "$ORIGIN_CERT" == 1 ]]; then
+            echo "  网站(公网)：   https://${DOMAIN}/"
+        else
+            echo "  网站(公网)：   http://${DOMAIN}/（启用 HTTPS 见 deploy/README.md）"
+        fi
         echo "  网站(内网)：   http://${SERVER_IP}/"
     else
         echo "  网站(内网)：   http://${SERVER_IP}/"
@@ -800,3 +1053,72 @@ if [[ $WITH_NGINX -eq 1 ]]; then
     echo "  Nginx 状态：  systemctl status nginx"
 fi
 echo "  日志：        journalctl -u gipfel -f   /   tail -F $INSTALL_DIR/backend/logs/app.log"
+
+# ============================================================
+# 部署自检：把「线上实际生效的状态」直接打出来。
+# 目的——**不需要人工去查 .env / 进程环境 / 监听端口**。任何一项不对，这里就说清是什么、怎么修。
+# 起因：多次出现「改了配置但没生效」的排查拉锯（.env 遗留值、改完没重启、端口没监听……
+#       每一样都得人工逐个去猜）。脚本既然知道期望值，就该自己核对并报告。
+# 注意：本段只读不写；任何一项失败都**不中止**（部署主体已完成，自检只做告知）。
+# ============================================================
+echo
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  部署自检（只读，不影响上面已完成的部署）"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+_SELFCHECK_WARN=0
+
+# 1) 后端进程**实际读到**的日志查看器地址（唯一算数的答案；进程环境来自 systemd EnvironmentFile）
+if command -v systemctl >/dev/null 2>&1; then
+    _pid="$(systemctl show -p MainPID gipfel 2>/dev/null | cut -d= -f2)"
+    if [[ -n "$_pid" && "$_pid" != "0" && -r "/proc/$_pid/environ" ]]; then
+        _eff="$(tr '\0' '\n' < "/proc/$_pid/environ" 2>/dev/null | grep -E '^LOG_VIEWER_PUBLIC_URL=' | tail -1 | cut -d= -f2- || true)"
+        if [[ -n "$_eff" ]]; then
+            echo "  [OK]   后端生效的日志查看器地址：${_eff}"
+            echo "         → 前端「系统设置 → 日志查看器」按钮应跳转到该地址"
+        else
+            echo "  [WARN] 后端进程环境里没有 LOG_VIEWER_PUBLIC_URL"
+            echo "         → 将按请求 Host 推导；若 Host 是 IP 会得到 http://<IP>:${LV_PORT}/（CF 代理下打不开）"
+            echo "         修：重跑本脚本（会自动写该变量），或检查 .env 是否被手工改回"
+            _SELFCHECK_WARN=1
+        fi
+    else
+        echo "  [WARN] 读不到 gipfel 进程环境（未运行或无权读取）→ systemctl status gipfel"
+        _SELFCHECK_WARN=1
+    fi
+fi
+
+# 2) 监听端口：80/443 必有；8443 视形态；8121 是日志查看器内部端口
+if command -v ss >/dev/null 2>&1; then
+    echo "  监听端口："
+    ss -lntp 2>/dev/null | grep -E ':(80|443|8121|8443)\b' | sed 's/^/    /' || echo "    （未匹配到 80/443/8121/8443）"
+    if [[ -n "$LOGVIEWER_TLS_PORT" ]] && ! ss -lnt 2>/dev/null | grep -qE ":${LOGVIEWER_TLS_PORT}\b"; then
+        echo "  [WARN] 已要求日志查看器监听 ${LOGVIEWER_TLS_PORT}，但它没有在监听"
+        echo "         → 多半是 nginx 未 reload 或缺少该 server 块：sudo nginx -t && sudo systemctl reload nginx"
+        _SELFCHECK_WARN=1
+    fi
+fi
+
+# 3) 日志查看器自身健康（绕开 nginx，直连内部端口）
+if curl -sS --max-time 5 http://127.0.0.1:8121/api/health >/dev/null 2>&1; then
+    echo "  [OK]   日志查看器（127.0.0.1:8121）健康检查通过"
+else
+    echo "  [WARN] 日志查看器 127.0.0.1:8121 健康检查失败 → systemctl status gipfel-logviewer"
+    _SELFCHECK_WARN=1
+fi
+
+# 4) 主机名白名单兜底核对（日志查看器 400 的经典成因）
+if [[ -n "$DOMAIN" && -f "$INSTALL_DIR/backend/.env" ]]; then
+    if grep -E '^DJANGO_ALLOWED_HOSTS=' "$INSTALL_DIR/backend/.env" | grep -qE "(^|,)${DOMAIN}(,|$)"; then
+        echo "  [OK]   DJANGO_ALLOWED_HOSTS 含 ${DOMAIN}"
+    else
+        echo "  [WARN] DJANGO_ALLOWED_HOSTS 不含 ${DOMAIN} → 经域名访问会 400"
+        _SELFCHECK_WARN=1
+    fi
+fi
+
+if [[ $_SELFCHECK_WARN -eq 0 ]]; then
+    echo "  自检结论：未发现问题。"
+else
+    echo "  自检结论：有 WARN 项，按上面每条的「修：」处理，然后重跑本脚本复核。"
+fi
+echo
