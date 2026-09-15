@@ -99,9 +99,17 @@ class X20StaticTests(unittest.TestCase):
         self.assertIn('if [[ "$INSTALL_DIR" != /* || ! "$INSTALL_DIR" =~ ^/[A-Za-z0-9._/-]+$ ]]', self.mig)
         self.assertIn('".."', self.mig)
 
-    def test_quick_sync_keeps_crlf(self):
+    def test_quick_sync_is_lf_only(self):
+        """X-27 之后 shell 脚本必须**全 LF**（`.gitattributes: *.sh text eol=lf`）。
+
+        本用例原先断言的是 X-27 之前的坏状态（`assertEqual(CRLF, LF)` = "必须是 CRLF"），
+        而提交 `179712f` 只新增了 `.gitattributes`、**没同步改这里** —— 于是文件改对之后
+        这个断言反而**恒失败**（文件已是 LF=315/CRLF=0，用例却在要求 CRLF）。
+        改为断言真正要保证的不变量：不得出现任何 CRLF（Linux 的 bash 不接受）。
+        """
         raw = QUICK.read_bytes()
-        self.assertEqual(raw.count(b"\r\n"), raw.count(b"\n"), "quick-sync.sh 行尾不再是 CRLF")
+        self.assertEqual(raw.count(b"\r\n"), 0, "quick-sync.sh 出现 CRLF —— Linux 的 bash 不接受")
+        self.assertGreater(raw.count(b"\n"), 0, "quick-sync.sh 不该是空文件")
 
 
 class X20RuntimeTests(unittest.TestCase):

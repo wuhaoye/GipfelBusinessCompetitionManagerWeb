@@ -31,6 +31,8 @@ import sys
 import unittest
 from pathlib import Path
 
+from _decoding import run_captured
+
 REPO = Path(__file__).resolve().parents[3]
 TESTS = REPO / "tests"
 REAL_DB = REPO / "backend" / "db.sqlite3"
@@ -53,13 +55,11 @@ def _sha256(path: Path) -> str | None:
 
 
 def _run(script: str) -> subprocess.CompletedProcess:
-    return subprocess.run(
+    # 解码走 tests/fix_verify/scripts/_decoding.py：被测脚本输出 UTF-8，但经 Windows
+    # 控制台/代码页时会变成 GBK；硬按 UTF-8 解会把中文断言串变成替换符（预先存在的夹具缺陷）。
+    return run_captured(
         [str(PY), str(TESTS / script)],
         cwd=str(REPO),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
         timeout=600,
     )
 
@@ -106,13 +106,9 @@ class X17RuntimeTests(unittest.TestCase):
                     "spec.loader.exec_module(m);"
                     "print('IMPORT_OK')"
                 )
-                proc = subprocess.run(
+                proc = run_captured(
                     [str(PY), "-c", probe],
                     cwd=str(REPO),
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
                     timeout=300,
                 )
                 self.assertEqual(

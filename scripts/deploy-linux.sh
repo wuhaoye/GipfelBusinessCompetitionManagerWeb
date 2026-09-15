@@ -534,18 +534,16 @@ if [[ -f "$INSTALL_DIR/backend/.env" ]]; then
         fi
     fi
     if [[ ${#AH_ENTRIES[@]} -gt 0 ]]; then
-        if grep -q '^DJANGO_ALLOWED_HOSTS=' "$INSTALL_DIR/backend/.env"; then
-            for _ah in "${AH_ENTRIES[@]}"; do
-                if ! grep -E "^DJANGO_ALLOWED_HOSTS=" "$INSTALL_DIR/backend/.env" | grep -qE "(^|,)${_ah}(,|$)"; then
-                    sed -i "s|^DJANGO_ALLOWED_HOSTS=.*|&,${_ah}|" "$INSTALL_DIR/backend/.env"
-                    ok "DJANGO_ALLOWED_HOSTS 已追加公网入口：${_ah}"
-                fi
-            done
-        else
-            _ah_new="$(IFS=,; echo "${AH_ENTRIES[*]}")"
-            echo "DJANGO_ALLOWED_HOSTS=${_ah_new},localhost,127.0.0.1" >> "$INSTALL_DIR/backend/.env"
-            ok "DJANGO_ALLOWED_HOSTS 已写入：${_ah_new},localhost,127.0.0.1"
-        fi
+        # 审计 X-11（master 合并后重做）：改前/原 master 版本用
+        #     sed -i "s|^DJANGO_ALLOWED_HOSTS=.*|&,${_ah}|" .env
+        # 来追加条目 —— `&` 是「整行匹配文本」，于是每追加一个新公网入口就把
+        # 旧条目**再复制一遍**（`A,B` → 追加 C 得 `A,B,A,B,C`），公网 IP/域名一变
+        # 白名单里就堆历史值；同名键多行时还会被逐行改写（python-dotenv 只认第一条）。
+        # 现在改为调用 lib 的 append_env_entry：逗号分隔去重合并 + 写回**唯一一行**。
+        _ah_join="$(IFS=,; echo "${AH_ENTRIES[*]}")"
+        _ah_value="$(append_env_entry "$INSTALL_DIR/backend/.env" "DJANGO_ALLOWED_HOSTS" \
+            "$_ah_join" "localhost,127.0.0.1")"
+        ok "DJANGO_ALLOWED_HOSTS 已写入（去重合并、唯一一行）：${_ah_value}"
     else
         warn "未能确定公网入口（域名/公网 IP 均为空），DJANGO_ALLOWED_HOSTS 未修改；若经公网访问出现 400，请手动在 backend/.env 加入 DJANGO_ALLOWED_HOSTS=<公网IP>,localhost"
     fi
@@ -1005,10 +1003,21 @@ echo
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 # 读取管理员密码并醒目输出（★ 必须容忍无匹配：首次部署 .env 尚未写入该行时 grep 退出 1，
 #   pipefail 下会让这行赋值失败 → set -e 在脚本最后一步静默终止，看不到任何凭据输出）
+# 审计 X-22（master 合并后重做）：这里曾无条件回显口令 —— 部署日志/CI 输出里
+#   会留下管理员明文。与上方「首次部署生成」处保持同一守卫：
+#   只有「显式 --print-seed-password **且** stdout 是终端」才打印。
 _SEED_PW="$(grep -E '^SEED_ADMIN_PASSWORD=' "$INSTALL_DIR/backend/.env" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]' | sed -E "s/^['\"]//; s/['\"]$//" || true)"
 if [[ -n "$_SEED_PW" ]]; then
-    echo "  👤 管理员账号：admin"
-    echo "  🔑 管理员密码：${_SEED_PW}"
+    if [[ "$PRINT_SEED_PASSWORD" == "1" && -t 1 ]]; then
+        echo "  👤 管理员账号：admin"
+        echo "  🔑 管理员密码：${_SEED_PW}"
+    else
+        echo "  👤 管理员账号：admin"
+        echo "  🔑 管理员密码：见 ${INSTALL_DIR}/backend/.env 的 SEED_ADMIN_PASSWORD"
+        if [[ "$PRINT_SEED_PASSWORD" == "1" ]]; then
+            warn "--print-seed-password 已给出，但 stdout 不是终端（管道/CI）—— 为避免口令进入日志，此处不打印。"
+        fi
+    fi
 else
     echo "  🔑 管理员密码：见 ${INSTALL_DIR}/backend/.env 的 SEED_ADMIN_PASSWORD"
     echo "     查看命令：sudo grep '^SEED_ADMIN_PASSWORD=' ${INSTALL_DIR}/backend/.env"

@@ -31,6 +31,8 @@ import subprocess
 import unittest
 from pathlib import Path
 
+from _decoding import run_captured
+
 REPO = Path(__file__).resolve().parents[3]
 BAT = REPO / "scripts" / "start-dev.bat"
 DEV_PY = REPO / "scripts" / "dev.py"
@@ -84,13 +86,9 @@ class X19RuntimeTests(unittest.TestCase):
     def _harness_output(self) -> str:
         if not HARNESS.is_file():
             self.skipTest("code_audit/_x19_harness.py 不存在（非交付物，允许缺失）")
-        proc = subprocess.run(
+        proc = run_captured(
             [str(PY), str(HARNESS), "after"],
             cwd=str(REPO),
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
             timeout=900,
         )
         out = (proc.stdout or "") + (proc.stderr or "")
