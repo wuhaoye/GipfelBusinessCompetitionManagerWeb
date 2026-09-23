@@ -282,4 +282,63 @@ print_rollback_hint() {
     return 0
 }
 
+# 确保运行用户（默认 gipfel）与其同名组存在；幂等，失败即中止（审计 X-30）。
+#
+# 背景（真机事故：Debian 13 + `su` 非登录 shell 部署）：
+#   ① 改前 deploy-linux.sh / update-from-github.sh 写的是
+#      `if ! id gipfel; then useradd … || true; fi`。`useradd` 位于 /usr/sbin，而 `su`（不带 `-`）
+#      的 PATH 是 /usr/local/bin:/usr/bin:/bin:/usr/games —— 不含 /usr/sbin，于是
+#      `useradd: command not found`(127) 被 `|| true` 吞掉；脚本带着"没有运行用户"继续跑完
+#      migrate + 前端构建，最后在 `chown -R gipfel:gipfel …` 处
+#      （deploy-linux.sh 第 634 行）以 `chown: invalid user: 'gipfel:gipfel'` 终止 ——
+#      报错完全指错方向（真正失败的是建用户，且发生在半小时之前）。同一 PATH 依赖还会让
+#      第 869 行的 `nginx -t`（/usr/sbin/nginx）二次引爆。
+#   ② 守卫 `id gipfel` 只查**用户**，而 `-U` 要求同名组未被占用：「组在、用户不在」时
+#      `useradd -U` 退出 9（`useradd: group gipfel exists … use -g`），同样被吞掉。
+#   ③ 该状态在真实运维中确实会出现：组内还有其它成员时 `userdel gipfel` **不会删组**
+#      （`userdel: group gipfel not removed because it has other members`），或曾执行过
+#      `groupadd gipfel`。
+#
+# 现在：用户与组一起校验；组已存在则用 `-g` 复用（不用 `-U`）；用户已在而组缺失则补建组；
+# 任何一步失败都立即以可操作的信息中止，绝不再留给后面的 chown 去报错。
+# 用法：ensure_runtime_user [用户名] [安装目录] [组名]
+ensure_runtime_user() {
+    local user="${1:-gipfel}"
+    local dir="${2:-/opt/$user}"
+    local group="${3:-$user}"
+    local bin=""
+
+    if id "$user" >/dev/null 2>&1 && getent group "$group" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    if ! id "$user" >/dev/null 2>&1; then
+        bin="$(command -v useradd 2>/dev/null || true)"
+        if [[ -z "$bin" || ! -x "$bin" ]]; then
+            err "找不到 useradd（PATH=$PATH）：请确认已安装 passwd 包，并用 'su -' 或 sudo 运行本脚本（'su' 非登录 shell 的 PATH 不含 /usr/sbin）"
+        fi
+        if getent group "$group" >/dev/null 2>&1; then
+            # 组已存在 → 复用该组（此时用 -U 会以 "group … exists" 失败，退出码 9）
+            "$bin" -r -s /usr/sbin/nologin -g "$group" -d "$dir" "$user"
+        else
+            # 用户与组都不存在 → 一次建出（-U 建同名组）
+            "$bin" -r -s /usr/sbin/nologin -U -d "$dir" "$user"
+        fi
+    fi
+
+    if ! getent group "$group" >/dev/null 2>&1; then
+        # 用户已在、组缺失 → useradd 会因"用户已存在"失败，必须单独补组
+        bin="$(command -v groupadd 2>/dev/null || true)"
+        if [[ -z "$bin" || ! -x "$bin" ]]; then
+            err "找不到 groupadd（PATH=$PATH）：请确认已安装 passwd 包，并用 'su -' 或 sudo 运行本脚本"
+        fi
+        "$bin" -r "$group"
+    fi
+
+    if ! id "$user" >/dev/null 2>&1 || ! getent group "$group" >/dev/null 2>&1; then
+        err "创建运行用户/组 $user 失败：请手工执行 'useradd -r -s /usr/sbin/nologin -U $user'（组已存在时用 -g $group）后重跑"
+    fi
+    log "运行用户/组 $user 已就绪"
+}
+
 

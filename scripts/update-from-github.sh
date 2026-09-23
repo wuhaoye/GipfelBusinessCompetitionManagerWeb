@@ -139,6 +139,11 @@ fi
 
 [[ $EUID -ne 0 ]] && { echo "请用 sudo 执行"; exit 1; }
 
+# 审计 X-30：本脚本要用 /usr/sbin 下的命令（useradd、nginx）；`su`（不带 `-`）的 PATH 不含
+# /usr/sbin，会让 `useradd` 变成 command not found（被 `|| true` 吞掉）或让 `nginx -t` 直接失败。
+# 显式补齐 sbin 路径，不再依赖调用者的环境。
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
+
 # 默认 INSTALL_DIR = 脚本所在目录的上级（clone 根）
 if [[ -z "$INSTALL_DIR" ]]; then
     SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
@@ -311,11 +316,14 @@ else
 fi
 
 
-# ---------------- 运行用户（幂等）----------------
-if ! id gipfel >/dev/null 2>&1; then
-    log "创建专用运行用户 gipfel"
-    useradd -r -s /usr/sbin/nologin -U -d "$INSTALL_DIR" gipfel || true
-fi
+# ---------------- 运行用户（幂等，审计 X-30）----------------
+# 改前是 `if ! id gipfel; then useradd … || true; fi`：`|| true` 吞掉一切失败（含
+# `command not found`、以及「组已存在而用户不在」时 useradd 的退出码 9），脚本继续把
+# migrate 跑完，最后在下方 `chown -R gipfel:gipfel` 处以 “invalid user” 报错退出 ——
+# 升级路径上部是"新库结构 + 旧代码"，排查方向还会被误导到权限问题。
+command -v ensure_runtime_user >/dev/null 2>&1 \
+    || err "缺少 scripts/lib/deploy-common.sh（ensure_runtime_user 未定义），无法创建运行用户；请确认 scripts/lib/ 随代码一起部署"
+ensure_runtime_user gipfel "$INSTALL_DIR"
 
 # ---------------- 拉取已完成（见上方代码获取逻辑）----------------
 ok "代码已更新到最新，开始应用更新"
@@ -424,6 +432,9 @@ cp -a dist/. "$INSTALL_DIR/frontend-dist/"
 # ---------------- 4. 文件归属与权限 ----------------
 # 所有步骤以 root 身份写入（.venv / db.sqlite3 / uploads / logs / frontend-dist），
 # 统一归属运行用户 gipfel，否则 systemd 以 gipfel 启动时无写权限。
+# 审计 X-30：chown 前再确认用户/组存在，避免上游建用户失败以 “chown: invalid user” 暴露。
+id gipfel >/dev/null 2>&1 && getent group gipfel >/dev/null 2>&1 \
+    || err "运行用户/组 gipfel 不存在，无法切换文件归属（请检查上面的 ensure_runtime_user 输出）"
 chown -R gipfel:gipfel "$INSTALL_DIR"
 chmod 600 "$INSTALL_DIR/backend/.env" 2>/dev/null || true
 ok "文件归属已切换为 gipfel，.env 权限收紧为 600"

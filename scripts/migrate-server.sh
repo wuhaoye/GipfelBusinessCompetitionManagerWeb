@@ -19,6 +19,11 @@
 
 set -euo pipefail
 
+# 审计 X-30：本脚本要调用 /usr/sbin 下的命令（useradd、nginx）。以 `su`（不带 `-`）运行时
+# PATH 不含 /usr/sbin，`useradd` 会变成 command not found 并被 `|| true` 吞掉，最终以 chown
+# 的 “invalid user/group” 报错收场。这里显式补齐 sbin 路径。
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
+
 # ==================== 颜色输出 ====================
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -219,6 +224,37 @@ remote_sudo() {
     remote_exec "$host" "sudo ${quoted% }"
 }
 
+# 生成「确保运行用户/组 gipfel 存在」的命令片段（审计 X-30）。
+#
+# 改前 push 模式先 `sudo chown -R gipfel:gipfel '$INSTALL_DIR/backend' 2>/dev/null || true`
+# （静默吞错），而建用户（`sudo useradd -r -s /usr/sbin/nologin gipfel || true`，**无 `-U`**）
+# 排在它后面的服务配置步骤里：目标机没有该用户时 chown 静默失败，文件留在 root:root ——
+# 服务能起来，但以 gipfel 身份写 db.sqlite3 / uploads 时权限拒绝（不报错的隐性故障）。
+# 另外 `useradd` 不带 `-U` 时是否建同名组取决于目标机 `/etc/login.defs` 的 `USERGROUPS_ENAB`：
+# 为 no 的机器上只建用户不建组 → `chown gipfel:gipfel` 报 `invalid group`，
+# 且 `deploy/*.service` 的 `Group=gipfel` 会让服务以 216/GROUP 启动失败。
+# pull 模式的 chown 更是连 `|| true` 都没有，`set -e` 下直接中止迁移。
+#
+# 片段语义：用户与组一起校验；组已存在则用 `-g` 复用（`-U` 会以 "group … exists" 失败）；
+# 仍失败则 exit 1 并给出可操作提示。用法：
+#   remote_exec "$REMOTE" "$(_ensure_runtime_user_cmd)"
+#   eval "$(_ensure_runtime_user_cmd)"     # 本机执行
+_ensure_runtime_user_cmd() {
+    cat <<EOF
+if ! id gipfel >/dev/null 2>&1 || ! getent group gipfel >/dev/null 2>&1; then
+    if getent group gipfel >/dev/null 2>&1; then
+        sudo useradd -r -s /usr/sbin/nologin -g gipfel -d '$INSTALL_DIR' gipfel
+    else
+        sudo useradd -r -s /usr/sbin/nologin -U -d '$INSTALL_DIR' gipfel
+    fi
+fi
+if ! id gipfel >/dev/null 2>&1 || ! getent group gipfel >/dev/null 2>&1; then
+    echo '[ERROR] 运行用户/组 gipfel 创建失败：请在目标机手工执行 useradd -r -s /usr/sbin/nologin -U gipfel 后重试' >&2
+    exit 1
+fi
+EOF
+}
+
 # rsync 传输
 rsync_transfer() {
     local src="$1"
@@ -325,8 +361,12 @@ if [[ "$MODE" == "push" ]]; then
     rsync_transfer "$INSTALL_DIR/deploy/" "$REMOTE:$INSTALL_DIR/deploy/"
 
     # 修复权限（审计 X-03：用 remote_sudo 逐参数转义；chmod/chown 的参数不再裸拼）
+    # 审计 X-30：先确保运行用户/组存在再 chown，且不再用 2>/dev/null 吞错。改前顺序相反
+    # （chown 在前、建用户在后且无 -U）：目标机没有该用户时 chown 静默失败，文件留在
+    # root:root —— 服务能起来但写 db.sqlite3/uploads 时权限拒绝（不报错的隐性故障）。
     log_info "修复文件权限..."
-    remote_exec "$REMOTE" "sudo chown -R gipfel:gipfel '$INSTALL_DIR/backend' 2>/dev/null || true"
+    remote_exec "$REMOTE" "$(_ensure_runtime_user_cmd)"
+    remote_exec "$REMOTE" "sudo chown -R gipfel:gipfel '$INSTALL_DIR/backend'"
     remote_exec "$REMOTE" "sudo chmod 600 '$INSTALL_DIR/backend/.env' 2>/dev/null || true"
     remote_exec "$REMOTE" "sudo chmod 755 '$INSTALL_DIR/backend/uploads' 2>/dev/null || true"
 
@@ -334,10 +374,7 @@ if [[ "$MODE" == "push" ]]; then
     if [[ "$SKIP_SERVICES" == false ]]; then
         log_step "[6/6] 配置目标服务器服务..."
         remote_exec "$REMOTE" "
-            # 创建系统用户（如不存在）
-            if ! id gipfel >/dev/null 2>&1; then
-                sudo useradd -r -s /usr/sbin/nologin gipfel || true
-            fi
+            # 运行用户/组已在 [5/6] 步确保存在（审计 X-30：建用户移到 chown 之前，此处不再重复）
 
             # 安装 systemd 服务
             sudo cp '$INSTALL_DIR/deploy/gipfel.service' /etc/systemd/system/
@@ -496,10 +533,9 @@ elif [[ "$MODE" == "pull" ]]; then
     if [[ "$SKIP_SERVICES" == false ]]; then
         log_step "[6/6] 配置本地服务..."
         if [[ "$DRY_RUN" == false ]]; then
-            # 创建系统用户
-            if ! id gipfel >/dev/null 2>&1; then
-                sudo useradd -r -s /usr/sbin/nologin gipfel || true
-            fi
+            # 运行用户/组（审计 X-30：用户与组一起校验、组已存在用 -g 复用、失败即中止；
+            # 改前 `useradd … || true` 不带 -U，USERGROUPS_ENAB=no 的机器上只建用户不建组）
+            eval "$(_ensure_runtime_user_cmd)"
 
             # 设置权限
             sudo chown -R gipfel:gipfel "$INSTALL_DIR/backend"

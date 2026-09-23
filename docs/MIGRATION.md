@@ -238,8 +238,12 @@ if [[ -d "/tmp/$BACKUP_DIR/frontend-dist" ]]; then
     sudo cp -a /tmp/$BACKUP_DIR/frontend-dist /opt/gipfel/
 fi
 
-# 设置权限
-sudo useradd -r -s /usr/sbin/nologin gipfel 2>/dev/null || true
+# 设置权限（运行用户与同名组；组已存在时改用 -g gipfel）
+# 注意：必须以 root 登录环境执行（sudo -i 或 su -）—— 用 `su`（不带 -）时 PATH 不含
+# /usr/sbin，useradd 会 command not found，随后的 chown 会以 "invalid user" 报错。
+if ! id gipfel >/dev/null 2>&1; then
+    sudo useradd -r -s /usr/sbin/nologin -U gipfel
+fi
 sudo chown -R gipfel:gipfel /opt/gipfel/backend
 sudo chmod 600 /opt/gipfel/backend/.env
 ```

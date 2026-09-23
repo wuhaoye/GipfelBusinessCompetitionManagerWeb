@@ -12,6 +12,13 @@ sudo bash scripts/deploy-linux.sh \
 
 > **依赖说明**：脚本默认会自动 `apt-get install` 所需系统包（`python3` / `nginx` / `nodejs` / **`rsync`** 等）。若使用 `--skip-install-deps` 跳过安装，需确保目标机**已装好 `rsync`**——代码同步阶段强依赖它，缺失会报 `rsync: command not found`。
 
+> **⚠️ 必须用 root 登录环境执行**：`sudo -i` 或 **`su -`**（带 `-`）。**不要用 `su`（不带 `-`）或 `su -c`** —— 它的 PATH 是
+> `/usr/local/bin:/usr/bin:/bin:/usr/games`，**不含 `/usr/sbin`**，于是 `useradd` 变成 `command not found`：创建运行用户的步骤会静默失败，
+> 脚本一路跑到前端构建之后才以 `chown: invalid user: 'gipfel:gipfel'` 报错退出，现场留下「`.venv`/`db.sqlite3`/前端产物都在、却没有 `gipfel`
+> 用户与 systemd 单元」的半成品部署，排查方向还会被误导到文件权限上。
+> 若部署账号不在 `sudoers`（Debian 安装时设置了 root 密码，就不会把首个用户加入 `sudo` 组），可 `su -` 后用 root 执行，或先
+> `usermod -aG sudo <用户名>`。脚本自身已启动时补齐 `/usr/sbin`（审计 X-30），但仍建议按规范使用登录 shell。
+
 ### 获取源码（clone 到服务器）
 
 部署脚本必须在源码树内执行（`scripts/deploy-linux.sh` 的相对路径依赖它所在目录），所以**先 clone 到服务器，再进去跑脚本**。

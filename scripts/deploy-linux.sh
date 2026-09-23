@@ -20,6 +20,13 @@ set -euo pipefail
 # 需要交互的场景（手动填写公网 IP）已在脚本内用显式 read < /dev/stdin 处理。
 exec 0</dev/null
 
+# 审计 X-30：本脚本要用 /usr/sbin 下的命令（useradd、nginx），而 `su`（不带 `-`）的 PATH 是
+# /usr/local/bin:/usr/bin:/bin:/usr/games —— 缺 /usr/sbin。真机事故：`useradd` 变成
+# `command not found` 被后面的 `|| true` 吞掉，第二次现场是 `nginx -t` 直接 command not found。
+# 这里显式补齐 sbin 路径，不再假设调用者的 PATH 恰好完整（apt-get/chown/systemctl 都在
+# /usr/bin，所以环境"看起来正常"，非常容易漏判）。
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
+
 # ---------------- 失败时必须说清「停在哪一行」 ----------------
 # 背景：`set -e` 失败时**不输出任何东西**，表现为脚本「跑一半就没了」，运维无法判断
 # 停在哪一步、该手工补哪一步（升级脚本上已真实发生一次）。故装 ERR trap 打出定位信息。
@@ -292,11 +299,14 @@ fi
 # rsync 是代码同步的硬依赖（即便 --skip-install-deps 也必须存在，否则下方 rsync 直接 command not found）
 command -v rsync >/dev/null 2>&1 || err "缺少 rsync，请先执行：apt-get install -y rsync（或重跑本脚本去掉 --skip-install-deps 以自动安装）"
 
-# ---------------- 1.5 创建专用运行用户 ----------------
-if ! id gipfel >/dev/null 2>&1; then
-    log "创建专用运行用户 gipfel"
-    useradd -r -s /usr/sbin/nologin -U -d "$INSTALL_DIR" gipfel || true
-fi
+# ---------------- 1.5 创建专用运行用户（审计 X-30）----------------
+# 改前是 `if ! id gipfel; then useradd … || true; fi`：失败被 `|| true` 吞掉，脚本带着
+# "没有运行用户"继续跑完 migrate + 前端构建，最后在下方 `chown -R gipfel:gipfel` 处
+# 以 `chown: invalid user: 'gipfel:gipfel'` 报错退出（真机事故）。
+# 现在交给公共库的 ensure_runtime_user：用户与组一起校验、组已存在时用 -g 复用、失败即中止。
+command -v ensure_runtime_user >/dev/null 2>&1 \
+    || err "缺少 scripts/lib/deploy-common.sh（ensure_runtime_user 未定义），无法创建运行用户；请确认 scripts/lib/ 随代码一起部署"
+ensure_runtime_user gipfel "$INSTALL_DIR"
 
 # ---------------- 2. 同步代码，必要时备份旧数据 ----------------
 if [[ -d "$INSTALL_DIR/backend" && -f "$INSTALL_DIR/backend/db.sqlite3" ]]; then
@@ -631,6 +641,10 @@ npm run build
 rm -rf "$INSTALL_DIR/frontend-dist"
 mkdir -p "$INSTALL_DIR/frontend-dist"
 cp -a dist/. "$INSTALL_DIR/frontend-dist/"
+# 审计 X-30：chown 前再确认运行用户/组存在 —— 避免上游建用户失败再次以
+# “chown: invalid user” 的形式暴露（本仓库真实事故：排查方向被带偏到权限问题）。
+id gipfel >/dev/null 2>&1 && getent group gipfel >/dev/null 2>&1 \
+    || err "运行用户/组 gipfel 不存在，无法切换文件归属（请检查 1.5 步 ensure_runtime_user 的输出）"
 chown -R gipfel:gipfel "$INSTALL_DIR/frontend-dist"
 ok "前端构建完成 → $INSTALL_DIR/frontend-dist"
 
