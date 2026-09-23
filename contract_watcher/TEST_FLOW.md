@@ -2,6 +2,10 @@
 
 > 目的：验证「合同通过 → 监听程序自动处理 → 原始存档 + 可读翻译版」全链路，
 > 以及自动生成/自动改名/热加载等自动化行为。全程**不修改任何代码**。
+>
+> 2026-09 新工作流的验证见文末「附录 B」：角色门禁、SQLite 分账、阈值/财年/手动触发、
+> 图形界面；对应脚本 `tests/fix_verify/watcher/e2e_watcher_backend.py` 与
+> `e2e_watcher_excel.py`（后者会真实启动 Excel）。
 
 ## 准备（第 0 步）
 
@@ -138,3 +142,51 @@ if __name__ == "__main__":
 ```
 
 > 提示：可读版文件中"公司名"取自已执行合同的 parties——脚本里 companyId=1 无真实公司时显示 `公司#1` 属正常；如需看公司名，先在系统里建公司并把 parties 的 companyId 换成真实 ID。
+
+---
+
+## 附录 B：新工作流（2026-09）自动化验证
+
+> 前置：后端已启动（默认 `http://127.0.0.1:8231`，可用 `E2E_SERVER` 覆盖）。
+> 两个脚本都会**自动创建并在结束时清理**测试数据（比赛/公司/合同类型/合同/账号/财年）。
+
+### B1. 后端 + SQLite 全流程（不启动 Excel）
+
+```powershell
+cd backend
+.\.venv\Scripts\python.exe ..\tests\fix_verify\watcher\e2e_watcher_backend.py
+```
+
+覆盖（19 项断言，全部通过方为成功）：
+
+| # | 验证点 | 期望 |
+| --- | --- | --- |
+| A1 | PLAYER 用 CLI 启动 | 退出码 3，stderr 提示 PLAYER 默认关闭 |
+| B1-B3 | COMPETITION_ADMIN 登录 | 角色放行、登录响应带 companyScopes |
+| B4-B5 | 公司范围 | 只有 companyScopes 内的公司被标为「可管理/记账目标」 |
+| C1-C3 | 合同通过 | 只写入 SQLite（按 companyId 分账）、范围外公司不入库、未达阈值不记账 |
+| C4-C6 | 达阈值 | 触发一次 batch（trigger=threshold），无记账规则时**不打开 Excel** |
+| D1-D3 | 手动请求 | 写入 `flush_requests` → 下一轮消费 → trigger=manual、请求标记 done |
+| E1-E3 | 财年更迭 | 超管关闭财年 → 增量轮询检测 FY_END → 触发结账（含本轮新入库合同） |
+
+### B2. 真实 Excel 写入（会启动 Excel，约 1-2 分钟）
+
+```powershell
+python tests\fix_verify\watcher\e2e_watcher_excel.py
+```
+
+覆盖（9 项断言）：
+
+| # | 验证点 | 期望 |
+| --- | --- | --- |
+| X1-X3 | 批量语义 | 3 份合同 = **一次** Excel 会话、3 笔分录、批次 success、合同全部已记账 |
+| X4-X5 | 账本 | `books/company_<id>.xlsx` 由模板复制生成并被写入 |
+| X6 | 平衡校验 | `shang.check()` 输出进批次 message（right / 失衡提示） |
+| X7-X8 | 读回核对 | openpyxl 读「银行流水账」：3 行摘要 + 金额正确 |
+| X9 | 进程回收 | 不残留新起的 `EXCEL.EXE` |
+
+### B3. 手工核对 SQLite（可选）
+
+```powershell
+python -c "import sys;sys.path.insert(0,'contract_watcher');import store;c=store.open_db('contract_watcher/data/watcher.db');print(store.company_overview(c));print([dict(r) for r in store.recent_batches(c)])"
+```

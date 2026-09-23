@@ -165,3 +165,42 @@ def handle_material_procurement_passed(contract: dict, ctx: dict) -> None:
 4. `executionResult.fields` 的键是 `"公司ID:字段key"` 字符串，先 `split(":")` 再取 ID；
 5. 未执行的合同 `executedAt` 为 null——监听程序只处理 `EXECUTED`，无需判断；
 6. 金额类数值可能是字符串（如 `"123.45"`），归档可直接用，运算前转 Decimal。
+
+---
+
+## 10. 批量记账阶段的 ctx（`phase == "book"`，2026-09 新增）
+
+处理函数会被调用两次：合同通过入库时 `phase == "collect"`（只有存档等非 Excel 行为），
+真正写账本时 `phase == "book"`。`book` 阶段除 §7 的字段外，额外提供：
+
+| 键 | 类型 | 说明 |
+| --- | --- | --- |
+| `phase` | str | `"book"`（批量记账）/ `"collect"`（合同入库） |
+| `book` | xledit | **本批次共用的** Excel 会话；勿自行 `save()`/`quit()` |
+| `add_entries` | callable | `add_entries(add=, minus=, number=, about=)` → 银行流水账 |
+| `add_item` | callable | `add_item(thing, name, number, price, add, minus)` → 原材料/零件/商品 |
+| `add_assets` | callable | `add_assets(type, name, add, minus)` → 资产/负债/损益科目 |
+| `record` | dict | 该合同在本地 SQLite 里的行：`company_id / contract_id / competition_id / type_key / name / contract_number / amount / executed_at / payload_json / readable_json …` |
+| `companyId` / `companyName` | int / str | 本次记账所属公司（**一本账本对应一家公司**） |
+| `trigger` | str | `threshold`（达阈值）/ `fiscal_year_end` / `fiscal_year_start` / `manual` |
+| `batchId` | int | 本次记账批次号（对应 `data/watcher.db` 的 `batches.id`） |
+| `out_dir` / `typeKey` / `default_archive` | 同 collect 阶段 | 输出目录 / 类型 key / 通用存档函数 |
+
+示例（按金额记一笔银行存款，同时更新资产科目）：
+
+```python
+def handle_material_procurement_passed(contract: dict, ctx: dict) -> None:
+    if ctx.get("phase") != "book":
+        return
+    from decimal import Decimal
+    amount = Decimal(str((contract.get("inputs") or {}).get("amount") or 0))
+    number = ctx["record"].get("contract_number") or f"#{contract['id']}"
+    ctx["add_entries"](add=amount, minus=Decimal(0), number=number, about=contract["name"])
+```
+
+要点：
+- **同一批次只开一次 Excel**：不要在处理函数里 `xledit(...)`；
+- 计数与金额都用 `Decimal(str(v))`，别用 `float`（`shang.py` 内部落 Excel 时才转 double）；
+- 处理函数抛异常 ⇒ 本批次不保存、合同保持未记账、60 秒内不自动重试（GUI 可强制重试）；
+- 没有可用记账规则的合同会被标记为「已记账（无分录）」，不会反复触发 Excel。
+

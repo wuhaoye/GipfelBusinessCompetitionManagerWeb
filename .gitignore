@@ -70,3 +70,11 @@ contract_watcher/handlers.py.tmp
 contract_watcher/test_run*/records/
 contract_watcher/test_run*/watcher.log
 contract_watcher/test_run*/handlers.py.*
+
+# ===== contract_watcher 新工作流产物（SQLite 分账 + 公司账本 + 本地配置）=====
+# data/ 已覆盖 watcher.db*（WAL 的 -wal/-shm 同目录）；账本含真实业务数据，配置可能含密码。
+contract_watcher/books/
+contract_watcher/config.json
+contract_watcher/config.json.tmp
+contract_watcher/**/*.xlsx.bak*
+contract_watcher/bookkeeping_example/no-such.xlsx

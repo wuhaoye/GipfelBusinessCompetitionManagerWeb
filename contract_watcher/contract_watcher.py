@@ -1,27 +1,44 @@
 # -*- coding: utf-8 -*-
 """合同通过监听程序（独立运行 · 只读后端 · 本机自动处理 · 不影响网页端）
 
-功能：
-  1. 静默常驻：默认只写本地日志，无控制台输出；--verbose 可见明细。
-  2. 监听合同通过：轮询 /api/contracts?status=EXECUTED，发现 executedAt 比
-     上次更新的合同（即"合同通过"信号）→ 拉详情 → 按合同类型 key 分发。
-  3. 按类型执行函数：处理函数定义在本目录 handlers.py 中，函数命名约定
-         handle_<key拼音形态>_passed(contract: dict, ctx: dict) -> None
-     未找到函数时使用内置默认行为（把合同全量 JSON 存档到 records/<key>/）。
-  4. 类型目录实时同步（新建/改名）：
-     - 轮询 /api/contract-types 维护 typeId → key 目录；
-     - 出现新 key → 自动在 handlers.py 末尾生成默认函数（幂等，不覆盖）；
-     - 某 typeId 的 key 改变 → 自动把对应函数"改名"（@标注行与函数名随新 key
-       更新，函数体原样保留），随后热加载立即生效。
-  5. 自动化保障：登录态自动续期、崩溃/断网不影响下一轮、单实例互斥、
-     已处理进度持久化（重启不重复）、handlers.py 被修改后自动热加载。
+工作流（2026-09 改版：**先入 SQLite，按公司分账，批量才写 Excel**）
+--------------------------------------------------------------
+1. **角色门禁**：只有 SUPER_ADMIN / COMPETITION_ADMIN 可使用；PLAYER 默认关闭
+   （要放开需显式 `--allow-player` 或配置 `allow_player=true`）。
+2. **只记录有管理权限的公司**：按登录账号的 companyScopes（公司管理范围）过滤，
+   超管视为全部公司；范围为空的账号没有任何可记录公司。可再从中**选择记账目标**
+   （GUI 勾选 / 配置 `record_company_ids` / `--companies`）。
+3. **合同先进入 SQLite**（`data/watcher.db`，按 company_id 分账）：合同通过时只写库，
+   零 COM；重复入库幂等（主键 company_id + contract_id）。
+4. **只在三种时机调用 `shang.py` 的 add_* 写 xlsx**（其余时候绝不启动 Excel，避免 COM 崩溃）：
+   - 同一公司未记账合同达到阈值（默认 10 条，`--threshold` / GUI 可改）；
+   - 财年结束 / 开始（后端财年更迭信号，见 apps/competitions/signals.py）；
+   - 手动请求（GUI「立即记账」/ 配置）。
+   每次触发对该公司的全部积压合同**只开一次** Excel 会话，处理函数在
+   `ctx["phase"] == "book"` 时用 `ctx["add_entries"] / add_item / add_assets` 记账。
+5. **Tkinter 窗口**（`--gui` 或 `python gui.py`）：登录、选择公司、手动记账、
+   按公司查看 SQLite 里的合同。
+
+原有能力（未改动）
+------------------
+- 轮询 `/api/contracts?status=EXECUTED` 增量协议发现「合同通过」，按类型分发到
+  `handlers.py` 的 `handle_<key>_passed(contract, ctx)`；未注册则默认存档
+  （原始 JSON + 可读翻译版 → `records/<key>/`）。
+- 类型目录实时同步（新 key 生成默认函数 / 改名自动跟随 / handlers.py 热加载）。
+- 登录态续期、失败退避、单实例锁、崩溃隔离、心跳与停滞看门狗。
 
 用法：
+    # 无界面常驻（默认新工作流：SQLite 入库 + 批量记账）
     python contract_watcher.py --server http://127.0.0.1:8000 ^
-        --username admin --password "xxx" [--competition 1]
-    （首次运行会建立进度基线：只处理"之后"新通过的合同；加 --backfill 处理存量）
+        --username admin --password "xxx" [--competition 1] [--threshold 10]
 
-账号要求：contract:view（+ 若要自动生成/改名功能则需 contractType:view）。
+    # 图形界面（登录 / 选公司 / 手动记账 / 查看合同）
+    python contract_watcher.py --gui
+    python gui.py
+
+    # 首次运行建立进度基线：只处理"之后"新通过的合同；加 --backfill 处理存量
+
+账号要求：contract:view（+ 自动生成/改名需 contractType:view；列公司需 company:view）。
 """
 from __future__ import annotations
 
@@ -48,6 +65,43 @@ HANDLERS_FILE = WATCHER_DIR / "handlers.py"
 STATE_FILE = WATCHER_DIR / "data" / "state.json"
 LOG_FILE = WATCHER_DIR / "watcher.log"
 RECORDS_DIR = WATCHER_DIR / "records"
+
+# 同目录模块（store / bookkeeping / watcher_config）按**文件路径**加载，不往 sys.path 里塞目录：
+# 本文件既可能被 `python contract_watcher.py` 直接运行（此时脚本目录已在 sys.path 上），
+# 也可能被测试用 importlib.spec_from_file_location 从任意 cwd 加载（此时不在）。
+# 若在这里 sys.path.insert(本目录)，会顺带让 `readable` 等模块在测试环境里变成"可导入"，
+# 改变既有代码路径的行为（例如默认存档会多写一份翻译版）——故统一走路径加载，行为与 cwd 无关。
+def _load_sibling(name: str):
+    key = f"contract_watcher_{name}"
+    cached = sys.modules.get(key)
+    if cached is not None:
+        return cached
+    spec = importlib.util.spec_from_file_location(key, WATCHER_DIR / f"{name}.py")
+    if spec is None or spec.loader is None:
+        raise ImportError(f"无法加载同目录模块 {name}.py（{WATCHER_DIR}）")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[key] = mod
+    try:
+        spec.loader.exec_module(mod)
+    except BaseException:
+        sys.modules.pop(key, None)
+        raise
+    return mod
+
+
+store = _load_sibling("store")                # SQLite 存储层（按公司分账）
+bookkeeping = _load_sibling("bookkeeping")    # 批量记账（SQLite → xlsx，一次 Excel 会话）
+watcher_config = _load_sibling("watcher_config")  # 本地配置（GUI 与命令行共用）
+
+# ==================== 新工作流默认值（SQLite 入库 + 批量记账） ====================
+# 同一公司未记账合同达到该条数即写入该公司 xlsx（GUI / 配置文件可改）
+DEFAULT_FLUSH_THRESHOLD = 10
+# 财年轮询最小间隔（秒）：财年切换是低频事件，不跟着 3 秒的合同轮询一起打
+DEFAULT_FISCAL_YEAR_INTERVAL = 60.0
+# 记账失败后的自动重试退避（秒）：失败合同保持未记账，但不能每轮都去开 Excel
+DEFAULT_FLUSH_RETRY_INTERVAL = 60.0
+# 允许使用本工具的角色（PLAYER 默认关闭，需 --allow-player / 配置 allow_player=true）
+DEFAULT_ALLOWED_ROLES = ("SUPER_ADMIN", "COMPETITION_ADMIN")
 
 MARKER_PREFIX = "# ===== [auto] ContractType.key = "
 MARKER_SUFFIX = " ====="
@@ -200,6 +254,118 @@ def now_iso() -> str:
     from datetime import datetime, timezone
 
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+# ==================== 新工作流的路径 / 角色门禁 / 公司范围 ====================
+
+def default_db_path() -> Path:
+    """SQLite 默认路径（按调用时的 WATCHER_DIR 计算，便于测试重定向）。"""
+    return WATCHER_DIR / "data" / "watcher.db"
+
+
+def default_books_dir() -> Path:
+    """公司账本目录默认值。"""
+    return WATCHER_DIR / "books"
+
+
+def default_book_template() -> Path:
+    """公司账本模板（复制来源）：bookkeeping_example/target.xlsx。"""
+    return WATCHER_DIR / "bookkeeping_example" / "target.xlsx"
+
+
+def allowed_roles(allow_player: bool = False) -> tuple[str, ...]:
+    roles = list(DEFAULT_ALLOWED_ROLES)
+    if allow_player and "PLAYER" not in roles:
+        roles.append("PLAYER")
+    return tuple(roles)
+
+
+def find_role_denial(role, allow_player: bool = False) -> str | None:
+    """角色门禁：返回拒绝原因字符串；None = 放行。
+
+    - 只允许 SUPER_ADMIN / COMPETITION_ADMIN（PLAYER 默认关闭，显式放开才允许）；
+    - **未知角色**（登录响应没有 role 字段，如自定义/精简后端实现）不拦截，由调用方
+      写告警日志 —— 否则一个字段缺失会让整个监听程序无法启动。
+    """
+    if role is None or str(role).strip() == "":
+        return None
+    role = str(role).strip().upper()
+    roles = allowed_roles(allow_player)
+    if role in roles:
+        return None
+    if role == "PLAYER":
+        return (
+            "PLAYER 账号默认不允许使用 contract_watcher"
+            "（如确需使用，请加 --allow-player 或在 config.json 里设置 allow_player=true）"
+        )
+    return f"角色 {role} 不在允许列表 {list(roles)} 内"
+
+
+def resolve_manageable_ids(role, company_scopes, company_ids=None) -> set[int] | None:
+    """「有权限管理的公司」集合。
+
+    - SUPER_ADMIN → None（不过滤 = 全部公司）
+    - 其它角色 → companyScopes（公司管理范围）里的公司 id
+      - 为空 ⇒ **空集合**（无可记录公司），与后端执行合同时的 `_assert_execute_scope` 口径一致
+    - company_ids 只用于日志提示（范围内但本地目录没有的公司会另行告警）
+    """
+    if str(role or "").strip().upper() == "SUPER_ADMIN":
+        return None
+    out: set[int] = set()
+    for raw in company_scopes or []:
+        try:
+            out.add(int(raw))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def parse_company_ids(text) -> list[int] | None:
+    """解析逗号分隔的公司 id（`--companies` / 配置里都是这个形态）。
+
+    - None / "all" / "*" → None（= 全部可管理公司）
+    - 空串 → []（显式「一个都不记」）
+    """
+    if text is None:
+        return None
+    if isinstance(text, (list, tuple, set)):
+        out: list[int] = []
+        for raw in text:
+            try:
+                out.append(int(raw))
+            except (TypeError, ValueError):
+                continue
+        return out
+    txt = str(text).strip()
+    if txt == "":
+        return []
+    if txt.lower() in ("all", "*"):
+        return None
+    out = []
+    for part in txt.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.append(int(part))
+        except ValueError:
+            log.warning("忽略无法解析的公司 id：%r", part)
+    return out
+
+
+def party_company_ids(contract: dict) -> list[int]:
+    """合同参与方里的公司 id（去掉主办方），保持出现顺序且去重。"""
+    out: list[int] = []
+    for p in contract.get("parties") or []:
+        if not isinstance(p, dict) or p.get("isHost"):
+            continue
+        cid = p.get("companyId")
+        if isinstance(cid, bool) or not isinstance(cid, (int, float)):
+            continue
+        value = int(cid)
+        if value not in out:
+            out.append(value)
+    return out
 
 
 def parse_executed_at(value):
@@ -390,6 +556,10 @@ class Backend:
         self.token: str | None = None
         # 审计 CW-12：最近一次增量拉取拿到的服务端时间（下一轮用它作游标）
         self.last_server_time: str | None = None
+        # 登录响应自带的用户资料（role / companyScopes / competitionId …）：
+        # 角色门禁与「有权限管理的公司」判定都以此为准，避免额外请求。
+        self.user_info: dict | None = None
+        self.role: str | None = None
 
     def login(self) -> None:
         env = http_json(
@@ -398,7 +568,40 @@ class Backend:
         )
         if env.get("code") != 0:
             raise RuntimeError(f"登录失败：{env.get('message')}")
-        self.token = env["data"]["token"]
+        data = env.get("data") or {}
+        self.token = data["token"]
+        user = data.get("user") if isinstance(data, dict) else None
+        if isinstance(user, dict):
+            self.user_info = user
+            self.role = user.get("role")
+        else:
+            self.user_info = None
+            self.role = None
+
+    @property
+    def competition_id(self):
+        """账号自身归属的比赛（超管可能为 None）。"""
+        info = self.user_info or {}
+        value = info.get("competitionId")
+        try:
+            return int(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    @property
+    def company_scopes(self) -> list[int]:
+        """公司管理范围（companyScopes）——「有权限管理的公司」的权威来源。"""
+        info = self.user_info or {}
+        scopes = info.get("companyScopes")
+        if not isinstance(scopes, list):
+            return []
+        out: list[int] = []
+        for raw in scopes:
+            try:
+                out.append(int(raw))
+            except (TypeError, ValueError):
+                continue
+        return out
 
     def api(self, path: str) -> dict:
         if not self.token:
@@ -419,6 +622,53 @@ class Backend:
         """全量合同类型目录（含 id/key/name）。"""
         data = self.api("/api/contract-types?enabledOnly=false")
         return data if isinstance(data, list) else data.get("items") or []
+
+    def fetch_companies(self, competition_id: int | None = None) -> list[dict]:
+        """全量公司列表（分页拉全），用于建立本地公司目录与范围校验。
+
+        非超管账号只能看到自己比赛/查看范围内的公司（后端既有隔离）；
+        超管不传 competitionId 时返回全部比赛的公司，配合 companyScopes 使用。
+        """
+        by_id: dict[int, dict] = {}
+        page = 1
+        while True:
+            params = {"page": str(page), "pageSize": "200"}
+            if competition_id is not None:
+                params["competitionId"] = str(competition_id)
+            data = self.api("/api/companies?" + urllib.parse.urlencode(params))
+            if isinstance(data, list):
+                batch, total = data, len(data)
+            else:
+                batch = data.get("items") or []
+                total = data.get("total") or len(batch)
+            for row in batch:
+                if not isinstance(row, dict):
+                    continue
+                try:
+                    by_id[int(row["id"])] = row
+                except (KeyError, TypeError, ValueError):
+                    continue
+            if not batch or len(batch) >= total:
+                break
+            page += 1
+        return list(by_id.values())
+
+    def fetch_fiscal_years(self, competition_id: int, updated_after: str | None = None,
+                           previous_ids=None) -> dict:
+        """某比赛的财年列表（优先走 updatedAfter 增量协议 —— 财年更迭的轮询信号）。
+
+        返回接口原始 data（增量响应含 items/existingIds/serverTime/incremental）。
+        """
+        params: dict[str, str] = {}
+        if updated_after:
+            params["updatedAfter"] = str(updated_after)
+        else:
+            params["page"] = "1"
+            params["pageSize"] = "200"
+        if previous_ids:
+            params["previousIds"] = ",".join(str(i) for i in previous_ids)
+        query = urllib.parse.urlencode(params)
+        return self.api(f"/api/competitions/{int(competition_id)}/fiscal-years?{query}")
 
     def fetch_executed_ids(
         self, competition_id: int | None, updated_after: str | None = None
@@ -733,6 +983,10 @@ def dispatch(contract: dict, registry: dict, out_dir: Path, competition_id: int 
     改前：异常在此被吞掉且无返回值，调用方（主循环）只按列表 max 推进水位 —— 处理失败的
     合同被水位越过，永久静默漏记、永不重试、无告警（审计 CW-02）。现在把成败回传给调用方，
     由调用方记入待处理队列并推迟水位。
+
+    2026-09 改版：此时只做「与 Excel 无关」的事（默认存档 / 自定义收集逻辑）。
+    `ctx["phase"] == "collect"`、`ctx["book"] is None`；真正的记账在批量触发时由
+    `bookkeeping.flush_company()` 以 `ctx["phase"] == "book"` 再次调用同一个处理函数。
     """
     key = (contract.get("contractType") or {}).get("key") or "unknown"
     ctx = {
@@ -740,6 +994,11 @@ def dispatch(contract: dict, registry: dict, out_dir: Path, competition_id: int 
         "typeKey": key,
         "competitionId": contract.get("competitionId", competition_id),
         "default_archive": default_archive,
+        # 新工作流：处理函数按 phase 分流；collect 阶段没有 Excel 会话（book=None）
+        "phase": "collect",
+        "book": None,
+        "record": None,
+        "companyIds": party_company_ids(contract),
     }
     fn = registry.get(key)
     if fn is None:
@@ -842,7 +1101,8 @@ def establish_baseline(
 
 
 def process_fresh_contracts(
-    backend: "Backend", state: dict, registry: dict, out_dir: Path, competition_id: int | None
+    backend: "Backend", state: dict, registry: dict, out_dir: Path, competition_id: int | None,
+    collector=None,
 ) -> None:
     """处理「新通过」的合同，并安全推进水位（审计 CW-02）。
 
@@ -853,6 +1113,9 @@ def process_fresh_contracts(
       - 上一轮失败的合同存于 state["pendingExecuted"]，每轮先重试，成功才移出队列；
       - 水位只推进到「已成功处理」的最新 executedAt，失败合同不会被水位越过；
       - 详情状态不符（列表说 EXECUTED、详情说不是）同样记入待处理并告警，而不是静默跳过。
+
+    2026-09 改版：传入 `collector` 时，先由它把合同写进 SQLite（按公司分账、零 COM）。
+    **入库失败也算本轮失败**（不推进水位、下一轮重试）—— 否则合同会被水位越过而永久漏记。
     """
     rows = backend.fetch_executed_ids(competition_id, state.get("lastUpdatedAt"))
     # 审计 CW-12：记下服务端时间作为下一轮的增量游标（增量协议返回 serverTime）
@@ -900,6 +1163,15 @@ def process_fresh_contracts(
             )
             still_pending.append({"id": cid, "executedAt": et})
             continue
+        if collector is not None:
+            try:
+                collector(contract)
+            except Exception:  # noqa: BLE001 - 入库失败不能推进水位（否则永久漏记）
+                log.exception(
+                    "合同 #%s 写入 SQLite 失败 → 记入待处理，水位不越过它，下一轮重试", cid
+                )
+                still_pending.append({"id": cid, "executedAt": et})
+                continue
         if dispatch(contract, registry, out_dir, competition_id):
             if parse_executed_at(et) is not None and (
                 parse_executed_at(advanced_to) is None or parse_executed_at(et) > parse_executed_at(advanced_to)
@@ -964,16 +1236,461 @@ def sync_catalog(
     return changed
 
 
-def main() -> int:
+# ==================== 新工作流：SQLite 入库 + 触发式批量记账 ====================
+
+def translate_readable(contract: dict):
+    """生成可读翻译版（失败返回 None，不影响主流程）。
+
+    用路径加载同目录 readable.py（见 `_load_sibling` 的说明），因此不论 cwd 如何都能翻译。
+    """
+    try:
+        readable = _load_sibling("readable")
+        rec = readable.translate_contract(contract)
+        return rec if isinstance(rec, dict) else None
+    except Exception:  # noqa: BLE001 - 翻译失败不影响入库
+        log.debug("可读翻译失败 contract=%s", contract.get("id"), exc_info=True)
+        return None
+
+
+def make_contract_collector(conn, *, stats: dict | None = None):
+    """构造「合同 → SQLite」的收集器（零 COM）。
+
+    规则：
+    - 只记录**有管理权限**的公司（store 里 manageable=1）；范围外的公司跳过并写日志；
+    - 参与方里没有公司的合同（纯主办方）不入库；
+    - 幂等：同一 (company_id, contract_id) 重复入库不会产生第二行，也不覆盖已记账标记。
+    """
+    counters = stats if stats is not None else {}
+
+    def collect(contract: dict) -> list[int]:
+        allowed = set(store.manageable_ids(conn))
+        if not allowed:
+            counters["no_scope"] = counters.get("no_scope", 0) + 1
+            log.warning(
+                "本地公司目录为空或账号没有任何「公司管理范围」：合同 #%s 不写入 SQLite"
+                "（请确认账号 companyScopes 与 /api/companies 权限）",
+                contract.get("id"),
+            )
+            return []
+        recorded: list[int] = []
+        readable = None
+        for cid in party_company_ids(contract):
+            if cid not in allowed:
+                counters["skipped"] = counters.get("skipped", 0) + 1
+                log.info(
+                    "合同 #%s 的参与公司 #%s 不在本账号的公司管理范围（companyScopes）内 → 不记录",
+                    contract.get("id"), cid,
+                )
+                continue
+            if readable is None:
+                readable = translate_readable(contract)
+            inserted = store.upsert_contract(conn, contract, cid, readable=readable)
+            counters["inserted" if inserted else "updated"] = (
+                counters.get("inserted" if inserted else "updated", 0) + 1
+            )
+            recorded.append(cid)
+        return recorded
+
+    return collect
+
+
+def split_fiscal_year_response(data):
+    """拆解财年接口响应 → (rows, existing_ids, server_time)。"""
+    if isinstance(data, list):
+        return data, None, None
+    if not isinstance(data, dict):
+        return [], None, None
+    rows = data.get("items")
+    if rows is None:
+        rows = data.get("fiscalYears") or []
+    return rows, data.get("existingIds"), data.get("serverTime")
+
+
+class WatcherSession:
+    """一轮监听工作的可复用主体（命令行主循环与 Tkinter 后台线程共用）。
+
+    持有：后端客户端、进度 state、handlers 注册表（列表引用，便于热加载替换）、
+    输出目录、SQLite 连接、记账配置（阈值 / 账本目录 / 模板）与心跳。
+    """
+
+    def __init__(
+        self,
+        *,
+        backend,
+        state: dict,
+        registry: list,
+        out_dir,
+        competition_id=None,
+        catalog_interval: float = DEFAULT_CATALOG_INTERVAL,
+        heartbeat=None,
+        conn=None,
+        threshold: int = DEFAULT_FLUSH_THRESHOLD,
+        auto_bookkeeping: bool = True,
+        fiscal_year_flush: bool = True,
+        fiscal_year_interval: float = DEFAULT_FISCAL_YEAR_INTERVAL,
+        flush_retry_interval: float = DEFAULT_FLUSH_RETRY_INTERVAL,
+        books_dir=None,
+        book_template=None,
+        backfill: bool = False,
+    ):
+        self.backend = backend
+        self.state = state
+        self.registry = registry                 # [dict]：热加载时替换 [0]
+        self.out_dir = Path(out_dir)
+        self.competition_id = competition_id
+        self.catalog_interval = catalog_interval
+        self.heartbeat = heartbeat
+        self.conn = conn
+        self.threshold = max(1, int(threshold))
+        self.auto_bookkeeping = bool(auto_bookkeeping)
+        self.fiscal_year_flush = bool(fiscal_year_flush)
+        self.fiscal_year_interval = float(fiscal_year_interval)
+        # 记账失败后的自动重试退避（秒）：避免「每轮都开一次 Excel」把 COM 拖崩
+        self.flush_retry_interval = max(0.0, float(flush_retry_interval))
+        self._flush_failures: dict[int, float] = {}
+        self.books_dir = Path(books_dir) if books_dir else default_books_dir()
+        self.book_template = Path(book_template) if book_template else default_book_template()
+        self.backfill = bool(backfill)
+
+        self.baseline_ready = False
+        self.last_mtime = None
+        self.collect_stats: dict = {}
+        self.last_round_info: dict = {}
+        self.fiscal_transitions: list[dict] = []
+        self._last_fy_poll = 0.0
+        self.collector = make_contract_collector(conn, stats=self.collect_stats) if conn is not None else None
+
+    # ---------- 基线 / 热加载 ----------
+    def establish_baseline(self) -> bool:
+        self.baseline_ready = establish_baseline(
+            self.backend, self.state, self.competition_id, self.backfill
+        )
+        return self.baseline_ready
+
+    def reload_handlers_if_changed(self) -> bool:
+        try:
+            mtime = HANDLERS_FILE.stat().st_mtime
+        except OSError:
+            return False
+        if self.last_mtime is None:
+            self.last_mtime = mtime
+            return False
+        if mtime != self.last_mtime:
+            self.last_mtime = mtime
+            self.registry[0] = load_handlers()
+            log.info("handlers.py 已变更，热加载完成")
+            return True
+        return False
+
+    # ---------- 一轮 ----------
+    def run_round(self) -> str:
+        """执行一轮；返回 'ok' 或 'retry'（基线未就绪）。异常向上抛给调用方。"""
+        if not self.baseline_ready:
+            if not self.establish_baseline():
+                return "retry"
+
+        self.reload_handlers_if_changed()
+        sync_catalog(self.backend, self.state, self.registry, self.catalog_interval)
+
+        before_watermark = self.state.get("lastExecutedAt")
+        process_fresh_contracts(
+            self.backend, self.state, self.registry[0], self.out_dir, self.competition_id,
+            collector=self.collector,
+        )
+        advanced = self.state.get("lastExecutedAt") != before_watermark
+
+        # 2026-09：入库之后才是「按触发条件批量记账」（threshold/财年/手动）
+        booked: list[str] = []
+        if self.conn is not None:
+            booked = self.post_process()
+
+        if self.heartbeat is not None:
+            pending = self.state.get("pendingExecuted") or []
+            self.heartbeat.tick(
+                f"水位={self.state.get('lastExecutedAt') or '（空）'}"
+                + ("（本轮有推进）" if advanced else "")
+                + (f"、待处理 {len(pending)} 个" if pending else "")
+                + (f"、记账 {'；'.join(booked)}" if booked else "")
+            )
+        self.last_round_info = {"advanced": advanced, "booked": booked}
+        return "ok"
+
+    # ---------- 批量记账：手动 / 财年 / 阈值 ----------
+    def post_process(self) -> list[str]:
+        """处理手动请求、财年更迭与阈值触发；返回人类可读的记账摘要。"""
+        summaries: list[str] = []
+        summaries += self.consume_flush_requests()
+        if self.fiscal_year_flush:
+            summaries += self.poll_fiscal_years()
+        if self.auto_bookkeeping:
+            summaries += self.check_thresholds()
+        return summaries
+
+    def _flush(self, company_id, trigger: str, requested_by: str | None, force: bool = False):
+        """对某公司执行一次批量记账。
+
+        失败退避：记账失败（Excel 打不开 / 处理函数报错）时合同会保持未记账，
+        若每个轮询周期都重试，就会变成「每 3 秒开一次 Excel」—— 正是要避免的 COM 崩溃场景。
+        因此同一家公司失败后 `flush_retry_interval` 秒内不再自动重试（手动请求 force=True 可越过）。
+        """
+        cid = int(company_id)
+        last_fail = self._flush_failures.get(cid)
+        if (
+            not force
+            and last_fail is not None
+            and (time.monotonic() - last_fail) < self.flush_retry_interval
+        ):
+            log.warning(
+                "公司 #%s 上次记账失败，%.0f 秒内不再自动重试（可用 GUI「立即记账」强制重试）",
+                cid, self.flush_retry_interval,
+            )
+            return bookkeeping.FlushResult(
+                company_id=cid, status=bookkeeping.STATUS_DEFERRED,
+                message=f"上次记账失败，{self.flush_retry_interval:.0f} 秒内暂不重试",
+            )
+        result = bookkeeping.flush_company(
+            self.conn, cid,
+            trigger=trigger,
+            books_dir=self.books_dir,
+            template=self.book_template,
+            registry=self.registry[0],
+            out_dir=self.out_dir,
+            requested_by=requested_by,
+        )
+        if result.status == bookkeeping.STATUS_FAILED:
+            self._flush_failures[cid] = time.monotonic()
+        else:
+            self._flush_failures.pop(cid, None)
+        return result
+
+    def selected_companies(self) -> list:
+        rows = store.list_companies(self.conn, selected_only=True)
+        return rows
+
+    @staticmethod
+    def _reportable(result) -> bool:
+        """只把「真的做了事」的结果计入心跳/日志摘要（skipped/deferred 是空动作）。"""
+        return result is not None and result.status not in (
+            bookkeeping.STATUS_SKIPPED, bookkeeping.STATUS_DEFERRED,
+        )
+
+    def check_thresholds(self) -> list[str]:
+        """同一公司未记账合同 ≥ 阈值 ⇒ 立即写该公司账本。"""
+        out: list[str] = []
+        counts = store.pending_counts(self.conn)
+        for row in self.selected_companies():
+            cid = int(row["company_id"])
+            if counts.get(cid, 0) < self.threshold:
+                continue
+            log.info(
+                "公司 #%s（%s）未记账合同 %d 份 ≥ 阈值 %d → 触发批量记账",
+                cid, row["name"], counts[cid], self.threshold,
+            )
+            result = self._flush(cid, "threshold", "auto")
+            if self._reportable(result):
+                out.append(self._describe(result, row["name"]))
+        return out
+
+    def consume_flush_requests(self) -> list[str]:
+        """消费 GUI/用户提交的手动记账请求（同一线程执行，保证 COM 串行）。"""
+        out: list[str] = []
+        for req in store.pending_flush_requests(self.conn):
+            targets: list[int]
+            if req["company_id"] is not None:
+                targets = [int(req["company_id"])]
+            else:
+                comp = req["competition_id"]
+                targets = [
+                    int(r["company_id"])
+                    for r in self.selected_companies()
+                    if comp is None or r["competition_id"] == comp
+                ]
+            results = []
+            for cid in targets:
+                # 手动请求是用户的明确动作 ⇒ force=True，越过失败退避
+                result = self._flush(cid, req["trigger"] or "manual",
+                                     req["requested_by"] or "manual", force=True)
+                results.append(result)
+                row = store.get_company(self.conn, cid)
+                if self._reportable(result):
+                    out.append(self._describe(result, row["name"] if row else cid))
+            status = "done" if all(r.ok for r in results) else "failed"
+            detail = (
+                f"触发={req['trigger'] or 'manual'}；"
+                + ("；".join(
+                    f"公司#{r.company_id}:{r.status}({r.entry_count}笔)" for r in results
+                ) or "没有已选择的公司")
+            )
+            store.finish_flush_request(self.conn, int(req["id"]), status, detail)
+            log.info("手动记账请求 #%s 处理完成：%s", req["id"], detail)
+        return out
+
+    def poll_fiscal_years(self) -> list[str]:
+        """轮询财年（增量），把 FY_END / FY_START 转成批量记账。"""
+        fetch = getattr(self.backend, "fetch_fiscal_years", None)
+        if not callable(fetch):
+            return []
+        now = time.monotonic()
+        if self.fiscal_year_interval > 0 and (now - self._last_fy_poll) < self.fiscal_year_interval:
+            return []
+        self._last_fy_poll = now
+
+        transitions: list[dict] = []
+        for competition_id in self.fiscal_competition_ids():
+            cursor = store.meta_get(self.conn, f"fyCursor:{competition_id}")
+            previous = store.meta_get_json(self.conn, f"fyPreviousIds:{competition_id}", None)
+            try:
+                data = fetch(competition_id, cursor, previous)
+            except Exception as e:  # noqa: BLE001 - 财年拉取失败不影响合同处理
+                log.warning("拉取财年列表失败 competition=%s：%s", competition_id, e)
+                continue
+            rows, existing_ids, server_time = split_fiscal_year_response(data)
+            try:
+                found = store.sync_fiscal_years(
+                    self.conn, competition_id, rows, existing_ids=existing_ids
+                )
+                if server_time:
+                    store.meta_set(self.conn, f"fyCursor:{competition_id}", server_time)
+                if existing_ids is not None:
+                    store.meta_set_json(self.conn, f"fyPreviousIds:{competition_id}", existing_ids)
+            except Exception:  # noqa: BLE001
+                log.exception("同步财年失败 competition=%s", competition_id)
+                continue
+            for tr in found:
+                tr["competition_id"] = competition_id
+            transitions += found
+
+        self.fiscal_transitions = transitions
+        out: list[str] = []
+        for tr in transitions:
+            trigger = "fiscal_year_end" if tr["transition"] == "FY_END" else "fiscal_year_start"
+            log.warning(
+                "检测到财年更迭：比赛 #%s %s（%s，财年 %s）→ 对已选择公司批量结账",
+                tr.get("competition_id"), tr["transition"], tr.get("reason"), tr.get("year"),
+            )
+            for row in self.selected_companies():
+                if tr.get("competition_id") is not None and \
+                        row["competition_id"] not in (None, tr["competition_id"]):
+                    continue
+                result = self._flush(int(row["company_id"]), trigger, "fiscal-year")
+                if self._reportable(result):
+                    out.append(self._describe(result, row["name"]))
+        return out
+
+    def fiscal_competition_ids(self) -> list[int]:
+        """需要跟踪财年的比赛：显式 --competition 优先，否则取本地公司目录里的比赛。"""
+        ids: list[int] = []
+        if self.competition_id:
+            ids.append(int(self.competition_id))
+        try:
+            rows = self.conn.execute(
+                "SELECT DISTINCT competition_id FROM companies WHERE competition_id IS NOT NULL "
+                "ORDER BY competition_id"
+            ).fetchall()
+        except Exception:  # noqa: BLE001
+            rows = []
+        for row in rows:
+            try:
+                cid = int(row["competition_id"])
+            except (TypeError, ValueError):
+                continue
+            if cid not in ids:
+                ids.append(cid)
+        return ids
+
+    @staticmethod
+    def _describe(result, company_name) -> str:
+        return (
+            f"公司#{result.company_id}({company_name}) {result.status}"
+            f" {result.contract_count}份/{result.entry_count}笔"
+        )
+
+
+class RoundRunner:
+    """跑一轮 + 统一异常/退避/认证失败计数（CLI 主循环与 GUI 后台线程共用）。"""
+
+    def __init__(self, session: WatcherSession, *, interval: float = 3.0,
+                 max_auth_failures: int = MAX_CONSECUTIVE_AUTH_FAILURES,
+                 sleep_fn=None, on_round=None):
+        self.session = session
+        self.interval = float(interval)
+        self.max_auth_failures = int(max_auth_failures)
+        self._sleep = sleep_fn or time.sleep
+        self.on_round = on_round
+        self.consecutive_failures = 0
+        self.consecutive_auth_failures = 0
+        self.current_delay = max(0.5, self.interval)
+        self.rounds = 0
+        self.auth_exit_message = ""
+        self.last_error: str | None = None
+
+    def step(self) -> str:
+        """执行一轮；返回 'ok' / 'retry' / 'auth_exit'（调用方据此决定是否退出）。"""
+        failed = False
+        try:
+            status = self.session.run_round()
+            if status == "retry":
+                failed = True
+        except urllib.error.HTTPError as e:
+            failed = True
+            if e.code == 401:
+                self.consecutive_auth_failures += 1
+                log.warning("登录态失效（连续第 %d 次），下一轮自动重登", self.consecutive_auth_failures)
+                # 审计 CW-10：凭据失效后无限静默失败 ⇒ 达到阈值明确报错退出
+                if self.consecutive_auth_failures >= self.max_auth_failures:
+                    msg = (
+                        f"连续 {self.consecutive_auth_failures} 轮登录失败"
+                        "（账号被禁用/改密/密码变更？），已停止监听："
+                        "请更新启动参数里的账号密码后重新运行"
+                    )
+                    log.error(msg)
+                    self.auth_exit_message = msg
+                    return "auth_exit"
+            else:
+                self.consecutive_auth_failures = 0
+                log.warning("后端请求失败 HTTP %s", e.code)
+                self.last_error = f"HTTP {e.code}"
+        except Exception as e:  # noqa: BLE001 - 静默容错：任何异常都不影响下一轮与网页端
+            failed = True
+            self.last_error = f"{type(e).__name__}: {e}"
+            log.exception("本轮执行异常（已隔离，继续下一轮）")
+
+        self.rounds += 1
+        if self.on_round is not None:
+            try:
+                self.on_round()
+            except Exception:  # noqa: BLE001 - 锁心跳等附属动作失败不影响主循环
+                log.debug("轮末回调失败", exc_info=True)
+
+        # 审计 CW-12：失败时指数退避（含抖动，上限 60s），成功后立即回到 --interval
+        if failed:
+            self.consecutive_failures += 1
+            self.current_delay = next_backoff(self.current_delay, self.interval)
+            log.info("连续第 %d 轮失败：本轮结束后退避 %.1fs 再试",
+                     self.consecutive_failures, self.current_delay)
+        else:
+            if self.consecutive_failures:
+                log.info("后端已恢复（此前连续失败 %d 轮）", self.consecutive_failures)
+            self.consecutive_failures = 0
+            self.consecutive_auth_failures = 0
+            self.current_delay = max(0.5, self.interval)
+        return "retry" if failed else "ok"
+
+    def wait(self) -> None:
+        """按当前退避时长等待（可被 GUI 的停止事件打断：sleep_fn 自行决定）。"""
+        self._sleep(self.current_delay)
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="合同通过监听程序（独立运行）")
-    ap.add_argument("--server", required=True)
-    ap.add_argument("--username", required=True)
-    ap.add_argument("--password", required=True)
+    ap.add_argument("--server", default=None, help="后端地址（也可写在 config.json / 用 --gui）")
+    ap.add_argument("--username", default=None)
+    ap.add_argument("--password", default=None)
     ap.add_argument("--competition", type=int, default=None)
-    ap.add_argument("--interval", type=float, default=3.0)
+    ap.add_argument("--interval", type=float, default=None, help="合同轮询间隔（秒，默认 3）")
     ap.add_argument(
-        "--catalog-interval", type=float, default=DEFAULT_CATALOG_INTERVAL,
-        help="合同类型目录的最小同步间隔（秒，0=每轮都同步）",
+        "--catalog-interval", type=float, default=None,
+        help="合同类型目录的最小同步间隔（秒，0=每轮都同步；默认 60）",
     )
     ap.add_argument("--out-dir", default=str(RECORDS_DIR))
     ap.add_argument("--port", type=int, default=47653, help="单实例互斥端口（仅本机有效）")
@@ -1000,7 +1717,29 @@ def main() -> int:
         "--no-exit-on-stall", action="store_true",
         help="检测到停滞时只告警、不退出（默认退出以便守护进程重启）",
     )
-    args = ap.parse_args()
+    # ---- 2026-09 新工作流（SQLite 分账 + 触发式批量记账） ----
+    ap.add_argument("--config", default=None, help="本地配置路径（默认 contract_watcher/config.json）")
+    ap.add_argument("--db", default=None, help="SQLite 路径（默认 data/watcher.db）")
+    ap.add_argument(
+        "--threshold", type=int, default=None,
+        help=f"同一公司未记账合同达到该条数即写入 xlsx（默认 {DEFAULT_FLUSH_THRESHOLD}）",
+    )
+    ap.add_argument(
+        "--companies", default=None,
+        help="记账目标公司 id，逗号分隔；all=全部可管理公司；留空=按配置/本地已保存的选择",
+    )
+    ap.add_argument("--books-dir", default=None, help="公司账本目录（默认 books/）")
+    ap.add_argument("--book-template", default=None, help="账本模板 xlsx（默认 bookkeeping_example/target.xlsx）")
+    ap.add_argument("--allow-player", action="store_true", help="允许 PLAYER 角色使用（默认关闭）")
+    ap.add_argument("--no-auto-book", action="store_true", help="关闭阈值/财年自动记账，只保留手动请求")
+    ap.add_argument("--no-fiscal-year-flush", action="store_true", help="关闭财年结束/开始自动结账")
+    ap.add_argument("--fiscal-year-interval", type=float, default=None, help="财年轮询最小间隔（秒，默认 60）")
+    ap.add_argument("--gui", action="store_true", help="启动 Tkinter 图形界面（登录/选公司/手动记账/查看合同）")
+    return ap
+
+
+def main() -> int:
+    args = build_arg_parser().parse_args()
 
     # 审计 CW-11：`--competition 0` / 负数会被下游的 `if competition_id:` 当成「不筛选」，
     # 于是监听程序悄悄跨**所有**比赛记账（把 A 比赛的合同记到 B 的账上）。这里显式拒绝。
@@ -1008,6 +1747,83 @@ def main() -> int:
         print(
             f"✗ --competition 必须是正整数（收到 {args.competition}）："
             "0/负数会被当成「不筛选」而跨比赛混记，已拒绝启动",
+            file=sys.stderr,
+        )
+        return 2
+
+    cfg = watcher_config.load_config(args.config, WATCHER_DIR)
+    cfg_path = args.config or str(watcher_config.config_path(WATCHER_DIR))
+
+    def pick(cli_value, key, default=None):
+        return cli_value if cli_value is not None else cfg.get(key, default)
+
+    server = pick(args.server, "server")
+    username = pick(args.username, "username")
+    password = pick(args.password, "password")
+    competition_id = args.competition if args.competition is not None else cfg.get("competition_id")
+    if competition_id is not None:
+        try:
+            competition_id = int(competition_id)
+        except (TypeError, ValueError):
+            print(f"✗ 比赛 id 非法：{competition_id!r}", file=sys.stderr)
+            return 2
+        if competition_id <= 0:
+            print(f"✗ 比赛 id 必须是正整数（收到 {competition_id}）", file=sys.stderr)
+            return 2
+
+    interval = float(pick(args.interval, "interval", 3.0) or 3.0)
+    catalog_interval = float(
+        args.catalog_interval if args.catalog_interval is not None else DEFAULT_CATALOG_INTERVAL
+    )
+    threshold = int(pick(args.threshold, "flush_threshold", DEFAULT_FLUSH_THRESHOLD) or DEFAULT_FLUSH_THRESHOLD)
+    threshold = max(1, threshold)
+    allow_player = bool(args.allow_player or cfg.get("allow_player"))
+    auto_bookkeeping = not args.no_auto_book and bool(cfg.get("auto_bookkeeping", True))
+    fiscal_year_flush = not args.no_fiscal_year_flush and bool(cfg.get("fiscal_year_flush", True))
+    fiscal_year_interval = float(
+        pick(args.fiscal_year_interval, "fiscal_year_interval", DEFAULT_FISCAL_YEAR_INTERVAL)
+        or DEFAULT_FISCAL_YEAR_INTERVAL
+    )
+    db_path = Path(args.db) if args.db else (Path(cfg["db_path"]) if cfg.get("db_path") else default_db_path())
+    books_dir = Path(args.books_dir) if args.books_dir else (
+        Path(cfg["books_dir"]) if cfg.get("books_dir") else default_books_dir()
+    )
+    book_template = Path(args.book_template) if args.book_template else (
+        Path(cfg["book_template"]) if cfg.get("book_template") else default_book_template()
+    )
+
+    # ---- 图形界面：把 CLI/配置值作为预填参数交给 GUI ----
+    if args.gui:
+        try:
+            import gui  # 同目录模块，延迟导入（无 GUI 环境/无 tkinter 时不影响命令行运行）
+        except Exception as e:  # noqa: BLE001 - 缺 tkinter / 无显示环境
+            print(
+                f"✗ 无法启动图形界面（{type(e).__name__}: {e}）。\n"
+                "  当前 Python 可能没有 tkinter（Linux 需安装 python3-tk）："
+                "请改用命令行参数运行。",
+                file=sys.stderr,
+            )
+            return 2
+
+        return gui.run_gui(
+            cfg=cfg, config_path=cfg_path,
+            overrides={
+                "server": server, "username": username, "password": password,
+                "competition_id": competition_id, "interval": interval,
+                "flush_threshold": threshold, "allow_player": allow_player,
+                "auto_bookkeeping": auto_bookkeeping, "fiscal_year_flush": fiscal_year_flush,
+                "fiscal_year_interval": fiscal_year_interval,
+                "db_path": str(db_path), "books_dir": str(books_dir),
+                "book_template": str(book_template),
+                "companies": args.companies,
+                "out_dir": args.out_dir,
+            },
+        )
+
+    if not server or not username or password in (None, ""):
+        print(
+            "✗ 缺少连接参数：请提供 --server/--username/--password，"
+            f"或把它们写进 {cfg_path}，或改用图形界面 --gui",
             file=sys.stderr,
         )
         return 2
@@ -1058,32 +1874,73 @@ def main() -> int:
                 pass
             state = {}
 
-    backend = Backend(args.server, args.username, args.password)
+    backend = Backend(server, username, password)
     try:
         backend.login()
     except Exception as e:  # noqa: BLE001
         print(f"启动失败（检查服务器地址/账号密码/是否已改密）：{e}", file=sys.stderr)
         return 1
 
+    # ---- 角色门禁：只允许 SUPER_ADMIN / COMPETITION_ADMIN（PLAYER 默认关闭） ----
+    # 用 getattr：自定义/精简后端与测试替身可能没有这些属性（未知角色按放行 + 告警处理）
+    role = getattr(backend, "role", None)
+    denial = find_role_denial(role, allow_player)
+    if denial:
+        msg = f"账号 {username} 的角色 {role} 不允许使用 contract_watcher：{denial}"
+        log.error("角色门禁拒绝启动：%s", msg)
+        print(f"✗ {msg}", file=sys.stderr)
+        instance_lock.release()
+        return 3
+    if role is None:
+        log.warning(
+            "登录响应未包含 role 字段：无法执行角色门禁（按放行处理）。"
+            "如后端版本较旧，请升级以启用「仅 COMPETITION_ADMIN/SUPER_ADMIN」限制"
+        )
+
+    # ---- SQLite：公司目录 + 记账目标 + 合同分账 ----
+    conn = None
+    try:
+        conn = store.open_db(db_path)
+        log.info("本地 SQLite 已就绪：%s", db_path)
+    except Exception as e:  # noqa: BLE001 - 入库失败仍可运行（退化为原有 JSON 存档）
+        log.error("SQLite 打开失败（%s）：本次不记录合同库，也不会批量记账；请检查目录权限", e)
+        conn = None
+
+    if conn is not None and callable(getattr(backend, "fetch_companies", None)):
+        try:
+            is_super = str(role or "").strip().upper() == "SUPER_ADMIN"
+            scope_competition = competition_id if is_super else getattr(backend, "competition_id", None)
+            companies = backend.fetch_companies(scope_competition)
+            manageable = resolve_manageable_ids(
+                role, getattr(backend, "company_scopes", []), [c.get("id") for c in companies]
+            )
+            synced = store.sync_companies(conn, companies, manageable)
+            log.info(
+                "公司目录同步完成：%d 家（新增 %d，可管理 %d）；公司管理范围=%s",
+                len(companies), synced["added"], synced["manageable"],
+                "全部（超管）" if manageable is None else sorted(manageable),
+            )
+            _apply_selection(
+                conn, args.companies if args.companies is not None else cfg.get("record_company_ids"),
+                manageable,
+            )
+            selected = store.selected_ids(conn)
+            log.info(
+                "记账目标公司：%s",
+                selected if selected else "（无：只有手动请求/重新选择后才会写 xlsx）",
+            )
+        except Exception as e:  # noqa: BLE001 - 公司目录拿不到就不记录（宁可少记不可越权记）
+            log.warning("公司目录同步失败（%s）：本轮不会写入任何公司合同", e)
+
     ensure_handlers_file()
     registry: list = [load_handlers()]
-    last_mtime = HANDLERS_FILE.stat().st_mtime
-    sync_catalog(backend, state, registry, args.catalog_interval)
 
     # 首次运行基线：未建立成功前不处理任何合同（审计 CW-01）
     # 连续认证失败计数（审计 CW-10）：达到阈值就明确报错退出，不再无限静默失败
-    consecutive_auth_failures = 0
-    try:
-        baseline_ready = establish_baseline(backend, state, args.competition, args.backfill)
-    except urllib.error.HTTPError as e:
-        if e.code != 401:
-            raise
-        # 启动时就 401：不直接崩，交给主循环按 CW-10 的阈值处理
-        consecutive_auth_failures = 1
-        baseline_ready = False
-        log.warning("登录态失效（连续第 1 次），下一轮自动重登")
-    log.info("监听启动 server=%s competition=%s out=%s backfill=%s",
-             args.server, args.competition, out_dir, args.backfill)
+    log.info(
+        "监听启动 server=%s competition=%s out=%s backfill=%s 阈值=%d 自动记账=%s 财年结账=%s",
+        server, competition_id, out_dir, args.backfill, threshold, auto_bookkeeping, fiscal_year_flush,
+    )
 
     # 审计 CW-19：心跳 + 停滞看门狗（轮询与处理同线程串行，挂起时这是唯一的可观测信号）
     heartbeat = LoopHeartbeat(
@@ -1102,91 +1959,76 @@ def main() -> int:
     else:
         log.info("未启用停滞看门狗（--stall-timeout 0）")
 
-    # 审计 CW-12：失败退避 —— 后端不可用时按指数+抖动退避，成功后立刻恢复常规节奏
-    consecutive_failures = 0
-    current_delay = max(0.5, args.interval)
+    session = WatcherSession(
+        backend=backend, state=state, registry=registry, out_dir=out_dir,
+        competition_id=competition_id, catalog_interval=catalog_interval,
+        heartbeat=heartbeat, conn=conn, threshold=threshold,
+        auto_bookkeeping=auto_bookkeeping, fiscal_year_flush=fiscal_year_flush,
+        fiscal_year_interval=fiscal_year_interval, books_dir=books_dir,
+        book_template=book_template, backfill=args.backfill,
+    )
+    try:
+        sync_catalog(backend, state, registry, catalog_interval)
+        try:
+            session.establish_baseline()
+        except urllib.error.HTTPError as e:
+            if e.code != 401:
+                raise
+            # 启动时就 401：不直接崩，交给主循环按 CW-10 的阈值处理
+            session.baseline_ready = False
+            log.warning("登录态失效（连续第 1 次），下一轮自动重登")
+            startup_auth_failure = 1
+        else:
+            startup_auth_failure = 0
+    except BaseException:
+        instance_lock.release()
+        raise
+
+    runner = RoundRunner(
+        session, interval=interval, on_round=instance_lock.heartbeat,
+    )
+    runner.consecutive_auth_failures = startup_auth_failure
 
     try:
         while True:
-            round_failed = False
-            try:
-                # 0) 基线未建立（首次拉取失败）→ 每轮重试，期间不处理合同
-                if not baseline_ready:
-                    baseline_ready = establish_baseline(
-                        backend, state, args.competition, args.backfill
-                    )
-                    if not baseline_ready:
-                        round_failed = True
-                        consecutive_failures += 1
-                        current_delay = next_backoff(current_delay, args.interval)
-                        time.sleep(current_delay)
-                        continue
-                # 1) handlers.py 被手动修改 → 热加载
-                try:
-                    mtime = HANDLERS_FILE.stat().st_mtime
-                    if mtime != last_mtime:
-                        last_mtime = mtime
-                        registry[0] = load_handlers()
-                        log.info("handlers.py 已变更，热加载完成")
-                except OSError:
-                    pass
-                # 2) 类型目录同步（新 key 生成 / key 改名自动改名；按 --catalog-interval 节流）
-                sync_catalog(backend, state, registry, args.catalog_interval)
-                # 3) 检测合同通过并处理；水位只在成功处理后推进（失败进待处理队列重试）
-                before_watermark = state.get("lastExecutedAt")
-                process_fresh_contracts(backend, state, registry[0], out_dir, args.competition)
-                # 审计 CW-19：每完成一轮就刷新心跳（看门狗据此判断主循环是否还在推进）
-                advanced = state.get("lastExecutedAt") != before_watermark
-                heartbeat.tick(
-                    f"水位={state.get('lastExecutedAt') or '（空）'}"
-                    + ("（本轮有推进）" if advanced else "")
-                    + (f"、待处理 {len(state.get('pendingExecuted') or [])} 个"
-                       if state.get("pendingExecuted") else "")
-                )
-            except urllib.error.HTTPError as e:
-                round_failed = True
-                if e.code == 401:
-                    consecutive_auth_failures += 1
-                    log.warning(
-                        "登录态失效（连续第 %d 次），下一轮自动重登", consecutive_auth_failures
-                    )
-                    # 审计 CW-10：改前凭据失效后无限静默失败 —— 进程不退、不告警、状态不变，
-                    # 用户以为程序在正常工作，实际上一条合同都不会再被处理。连续失败到阈值即
-                    # 明确报错退出，让守护进程/运维能发现。
-                    if consecutive_auth_failures >= MAX_CONSECUTIVE_AUTH_FAILURES:
-                        msg = (
-                            f"连续 {consecutive_auth_failures} 轮登录失败（账号被禁用/改密/密码变更？），"
-                            "已停止监听：请更新启动参数里的账号密码后重新运行"
-                        )
-                        log.error(msg)
-                        print(f"✗ {msg}", file=sys.stderr)
-                        return 1
-                else:
-                    consecutive_auth_failures = 0
-                    log.warning("后端请求失败 HTTP %s", e.code)
-            except Exception:  # noqa: BLE001 - 静默容错：任何异常都不影响下一轮与网页端
-                round_failed = True
-                log.exception("本轮执行异常（已隔离，继续下一轮）")
-
-            # 审计 CW-12：改前无论成败都固定 `time.sleep(max(0.5, --interval))` —— 后端不可用时
-            # 仍以同一节奏持续打请求且永不衰减。现在失败时指数退避（含抖动，上限 60s），
-            # 成功后立即回到 `--interval`。
-            if round_failed:
-                consecutive_failures += 1
-                current_delay = next_backoff(current_delay, args.interval)
-                log.info("连续第 %d 轮失败：本轮结束后退避 %.1fs 再试", consecutive_failures, current_delay)
-            else:
-                if consecutive_failures:
-                    log.info("后端已恢复（此前连续失败 %d 轮）", consecutive_failures)
-                consecutive_failures = 0
-                current_delay = max(0.5, args.interval)
-            # 审计 CW-20：每轮刷新共享锁心跳，让别的实例知道本实例还活着（否则会被判过期接管）
-            instance_lock.heartbeat()
-            time.sleep(current_delay)
+            outcome = runner.step()
+            if outcome == "auth_exit":
+                print(f"✗ {runner.auth_exit_message}", file=sys.stderr)
+                return 1
+            runner.wait()
     except BaseException:
         # 审计 CW-20：异常/中断退出时释放共享锁（否则别的机器要等心跳过期才能接管）
         instance_lock.release()
         raise
+
+
+def apply_company_selection(conn, spec, manageable) -> list[int]:
+    """把「记账目标公司」写入本地库（spec 为 None 时保留库中已有选择）。
+
+    spec：None=保留 / []=全不选 / [ids]=只选这些（自动与公司管理范围求交）。
+    `manageable`：账号可管理的公司集合（None=超管，不过滤）。
+    返回最终选中的公司 id。GUI 与命令行共用本函数。
+    """
+    if spec is None:
+        return store.selected_ids(conn)
+    wanted = spec if isinstance(spec, list) else parse_company_ids(spec)
+    if wanted is None:
+        wanted = [int(r["company_id"]) for r in store.list_companies(conn, manageable_only=True)]
+    if manageable is not None:
+        allowed = set(manageable)
+        dropped = [i for i in wanted if i not in allowed]
+        if dropped:
+            log.warning("以下公司不在账号的公司管理范围（companyScopes）内，已忽略：%s", dropped)
+        wanted = [i for i in wanted if i in allowed]
+    all_rows = store.list_companies(conn)
+    store.set_selected_companies(conn, [int(r["company_id"]) for r in all_rows], False)
+    if wanted:
+        store.set_selected_companies(conn, wanted, True)
+    return store.selected_ids(conn)
+
+
+# 向后兼容的私有别名（早期调用点用下划线名字）
+_apply_selection = apply_company_selection
 
 
 def rows_max(rows: list) -> str:

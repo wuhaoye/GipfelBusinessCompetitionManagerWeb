@@ -15,7 +15,9 @@ from rest_framework.views import APIView
 
 from apps.common.exceptions import BusinessError
 from apps.common.guards import PermissionsPermission, require_permissions
+from apps.common.helpers import parse_previous_ids as _parse_previous_ids
 from apps.common.pagination import paginated_response, parse_pagination
+from apps.common.sync import apply_updated_after, build_incremental_result
 from apps.realtime.emit import emit_to_competition
 
 from .models import Competition, FiscalYear
@@ -163,13 +165,36 @@ class CompetitionDeleteView(APIView):
 
 # ==================== 财年 ====================
 class FiscalYearListView(APIView):
-    """GET /api/competitions/:id/fiscal-years —— 列出某比赛财年（分页）。"""
+    """GET /api/competitions/:id/fiscal-years —— 列出某比赛财年（分页 / 增量）。
+
+    增量协议（`?updatedAfter=<ISO>`）：只返回 `updated_at` 晚于基线的财年，并附带
+    `serverTime` / `existingIds` / `deletedIds`（与 companies/contracts 等列表一致）。
+    这是财年更迭的**可轮询信号**：外部工具（contract_watcher）按游标轮询本接口，
+    与本地状态比对即可推导 FY_START / FY_END，且不会因轮询间隔错过信号
+    （进程内信号见 apps.competitions.signals）。
+    """
 
     permission_classes = _PERM_CLASSES
 
     def get(self, request, cid):
         comp = _get_competition(cid, request.user)
-        qs = comp.fiscal_years.all().order_by("-year")
+        qs = comp.fiscal_years.all()
+
+        updated_after = request.query_params.get("updatedAfter")
+        where, incremental, _ = apply_updated_after({}, updated_after)
+        if incremental:
+            items = FiscalYearSerializer(
+                qs.filter(**where).order_by("-updated_at"), many=True
+            ).data
+            all_current_ids = list(qs.values_list("pk", flat=True))
+            previous_ids = _parse_previous_ids(request.query_params.get("previousIds"))
+            return Response(
+                build_incremental_result(
+                    items, all_current_ids, previous_ids, total=len(items)
+                )
+            )
+
+        qs = qs.order_by("-year")
         page, page_size, skip = parse_pagination(request.query_params)
         total = qs.count()
         items = FiscalYearSerializer(

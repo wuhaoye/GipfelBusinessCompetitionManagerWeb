@@ -40,3 +40,18 @@ class FiscalYear(models.Model):
         db_table = "fiscal_years"
         unique_together = (("competition", "year"),)
         indexes = [models.Index(fields=["competition", "updated_at"])]
+
+    def save(self, *args, **kwargs):
+        """保存前记录库中的原状态，供财年更迭信号判定迁移（ACTIVE→CLOSED 等）。
+
+        Django 的 post_save 不提供字段级 diff，而「财年更迭」恰恰是**状态迁移**语义
+        （views 里原先只能自己比对 prev_status，仅在接口路径上成立；这里覆盖 save()
+        后，ORM / admin / 归档导入等所有写路径都能得到一致的迁移判定）。
+
+        代价是每次更新多一次主键查询；财年写入是低频操作（一年一次），可以接受。
+        """
+        if self.pk:
+            self._fy_prev_status = (
+                type(self).objects.filter(pk=self.pk).values_list("status", flat=True).first()
+            )
+        super().save(*args, **kwargs)

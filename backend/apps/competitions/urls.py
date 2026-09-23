@@ -7,10 +7,15 @@
 - GET    /api/competitions/:id                      详情
 - PATCH  /api/competitions/:id                      更新
 - DELETE /api/competitions/:id                      删除
-- GET    /api/competitions/:id/fiscal-years         财年列表
+- GET    /api/competitions/:id/fiscal-years         财年列表（分页；带 updatedAfter 时走增量协议，
+                                                    外部监听程序据此轮询「财年更迭」信号）
 - POST   /api/competitions/:id/fiscal-years         创建财年
 - PATCH  /api/competitions/fiscal-years/:id         更新财年
 - DELETE /api/competitions/fiscal-years/:id          删除财年
+
+财年变化还会通过 apps.competitions.signals 发出进程内信号
+（fiscal_year_changed / fiscal_year_started / fiscal_year_ended），
+并沿用 Socket.IO 的 fiscal-year:changed 广播。
 """
 from django.urls import path
 
