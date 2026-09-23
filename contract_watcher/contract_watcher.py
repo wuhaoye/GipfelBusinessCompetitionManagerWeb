@@ -1332,6 +1332,7 @@ class WatcherSession:
         books_dir=None,
         book_template=None,
         backfill: bool = False,
+        lock=None,
     ):
         self.backend = backend
         self.state = state
@@ -1351,6 +1352,9 @@ class WatcherSession:
         self.books_dir = Path(books_dir) if books_dir else default_books_dir()
         self.book_template = Path(book_template) if book_template else default_book_template()
         self.backfill = bool(backfill)
+        # 单实例锁（可选）：CLI 主循环与 GUI 监听线程共用同一把锁文件，
+        # 防止两个进程/线程同时打开 Excel 写同一本账；长批次期间由 flush 回调刷新心跳。
+        self.lock = lock
 
         self.baseline_ready = False
         self.last_mtime = None
@@ -1413,6 +1417,7 @@ class WatcherSession:
                 + (f"、记账 {'；'.join(booked)}" if booked else "")
             )
         self.last_round_info = {"advanced": advanced, "booked": booked}
+        self.heartbeat_lock()
         return "ok"
 
     # ---------- 批量记账：手动 / 财年 / 阈值 ----------
@@ -1456,12 +1461,18 @@ class WatcherSession:
             registry=self.registry[0],
             out_dir=self.out_dir,
             requested_by=requested_by,
+            on_progress=self.heartbeat_lock,
         )
         if result.status == bookkeeping.STATUS_FAILED:
             self._flush_failures[cid] = time.monotonic()
         else:
             self._flush_failures.pop(cid, None)
         return result
+
+    def heartbeat_lock(self) -> None:
+        """刷新单实例锁心跳（每轮 + 长批次期间由 bookkeeping 回调）。"""
+        if self.lock is not None:
+            self.lock.heartbeat()
 
     def selected_companies(self) -> list:
         rows = store.list_companies(self.conn, selected_only=True)
@@ -1965,7 +1976,7 @@ def main() -> int:
         heartbeat=heartbeat, conn=conn, threshold=threshold,
         auto_bookkeeping=auto_bookkeeping, fiscal_year_flush=fiscal_year_flush,
         fiscal_year_interval=fiscal_year_interval, books_dir=books_dir,
-        book_template=book_template, backfill=args.backfill,
+        book_template=book_template, backfill=args.backfill, lock=instance_lock,
     )
     try:
         sync_catalog(backend, state, registry, catalog_interval)

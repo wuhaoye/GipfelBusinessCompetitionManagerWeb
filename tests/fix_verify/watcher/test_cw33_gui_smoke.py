@@ -102,6 +102,7 @@ class GuiSmokeTests(unittest.TestCase):
             "books_dir": str(self.tmp / "books"),
             "book_template": str(self.tmp / "template.xlsx"),
             "out_dir": str(self.tmp / "records"),
+            "lock_file": str(self.tmp / "watcher.lock"),
         }
         self.root = tk.Tk()
         self.root.withdraw()
@@ -255,12 +256,39 @@ class GuiSmokeTests(unittest.TestCase):
         self.app.var_threshold.set("1")
         self.app.toggle_engine()
         self.assertTrue(self.app.engine.running, "点击后监听线程应启动")
+        lock_path = self.tmp / "watcher.lock"
+        self.assertTrue(lock_path.exists(), "监听线程启动时必须持有单实例锁")
         waiter = threading.Event()
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline and self.app.engine.runner is None:
             waiter.wait(0.05)
         self.app.toggle_engine()
         self.assertFalse(self.app.engine.running, "再次点击应停止监听")
+        self.assertFalse(lock_path.exists(), "停止监听必须释放单实例锁")
+
+    def test_engine_refuses_when_another_instance_holds_the_lock(self):
+        """命令行监听程序（或另一个界面）在跑时，界面不得再启动第二个监听。"""
+        other = gui.cw.SharedLock(self.tmp / "watcher.lock", owner="other-host:999")
+        acquired, _why = other.acquire()
+        self.assertTrue(acquired)
+        warnings: list = []
+        original = gui.messagebox.showwarning
+        gui.messagebox.showwarning = lambda title, msg, **k: warnings.append((title, msg))
+        try:
+            self.app.toggle_engine()
+        finally:
+            gui.messagebox.showwarning = original
+            other.release()
+        self.assertTrue(any("已有实例" in t for t, _ in warnings), warnings)
+        self.assertFalse(self.app.engine is not None and self.app.engine.running,
+                         "锁被占用时不得启动监听线程")
+        self.assertIsNone(self.app.instance_lock)
+
+    def test_close_releases_lock(self):
+        self.app.toggle_engine()
+        self.assertTrue(self.app.engine.running)
+        self.app.on_close()
+        self.assertFalse((self.tmp / "watcher.lock").exists(), "关闭窗口必须释放锁")
 
 
 gui_backend_original = getattr(gui.cw, "Backend", None) if gui is not None else None

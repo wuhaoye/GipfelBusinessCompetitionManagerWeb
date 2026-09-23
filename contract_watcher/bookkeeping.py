@@ -315,6 +315,7 @@ def flush_company(
     shang_dir=None,
     debug: bool = False,
     log_event: bool = True,
+    on_progress=None,
 ) -> FlushResult:
     """把 `company_id` 名下所有未记账合同一次性写入该公司账本。
 
@@ -322,11 +323,22 @@ def flush_company(
     - 没有任何合同注册了处理函数 → 同样不打开 Excel，只把合同标记为已记账（无分录）；
     - 打开 Excel 后逐份调用处理函数；成功则 `save()`（内部保存+关闭+退出）；
     - 任一步失败：放弃会话（不保存）、合同保持未记账、批次标记失败，下个触发点重试。
+
+    `on_progress`：批次推进时的回调（每个合同、保存前各调一次）。单实例锁用它刷新心跳 ——
+    一个批次的 Excel 会话可能跑好几分钟，不刷心跳会被别的实例判成「锁过期」而接管。
     """
     company_id = int(company_id)
     registry = _default_registry() if registry is None else registry
     company = store.get_company(conn, company_id)
     company_name = company["name"] if company is not None else f"公司#{company_id}"
+
+    def beat() -> None:
+        if on_progress is None:
+            return
+        try:
+            on_progress()
+        except Exception:  # noqa: BLE001 - 心跳失败不该影响记账
+            log.debug("flush 进度回调失败", exc_info=True)
 
     book_path = book_path_for(books_dir, company_id)
     # 崩溃残留必须先处理：它会把「结果未知」的合同标记掉，随后取待记账集合时就不会再重放
@@ -355,6 +367,7 @@ def flush_company(
     if not tasks:
         # 全都没有可用的记账规则（未注册，或只有自动生成的默认函数）：不打开 Excel，
         # 直接把它们标记为「已记账（无分录）」，避免同一批合同反复触发 Excel 会话
+        beat()
         batch_id = store.create_batch(
             conn, company_id, competition_id=competition_id, trigger=trigger,
             requested_by=requested_by, contract_ids=contract_ids, book_path=str(book_path),
@@ -392,9 +405,11 @@ def flush_company(
     captured = io.StringIO()
     balance = ""
     try:
+        beat()
         book = factory(book_path)
         session = BookSession(book)
         for row, fn in tasks:
+            beat()                      # 每份合同刷一次心跳（Excel 会话可能很久）
             record = dict(row)
             ctx = {
                 "phase": "book",
@@ -417,6 +432,7 @@ def flush_company(
                 fn(_contract_payload(row), ctx)
 
         with contextlib.redirect_stdout(captured):
+            beat()                      # 保存前再刷一次：这一步可能最慢
             checker = getattr(session.book, "check", None)
             if callable(checker):
                 try:

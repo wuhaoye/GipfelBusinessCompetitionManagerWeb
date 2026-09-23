@@ -160,6 +160,7 @@ class WatcherApp:
         self.backend = None
         self.conn = None
         self.engine: GuiEngine | None = None
+        self.instance_lock = None
         self.log_queue: "queue.Queue[str]" = queue.Queue()
         self._logging_handler = None
         self._worker: threading.Thread | None = None
@@ -322,6 +323,12 @@ class WatcherApp:
             return float(self.overrides.get("interval") or self.cfg.get("interval") or 3.0)
         except (TypeError, ValueError):
             return 3.0
+
+    @property
+    def lock_file(self) -> Path:
+        """单实例锁文件：与命令行 `--lock-file` 默认值同一个（互相排斥）。"""
+        raw = self.overrides.get("lock_file") or self.cfg.get("lock_file")
+        return Path(raw) if raw else cw.WATCHER_DIR / "data" / "watcher.lock"
 
     @property
     def allow_player(self) -> bool:
@@ -573,7 +580,7 @@ class WatcherApp:
         self._worker.start()
 
     # ==================== 监听开关 ====================
-    def build_session(self, conn):
+    def build_session(self, conn, lock=None):
         state = {}
         if cw.STATE_FILE.exists():
             try:
@@ -597,6 +604,7 @@ class WatcherApp:
                 or cw.DEFAULT_FISCAL_YEAR_INTERVAL
             ),
             books_dir=self.books_dir, book_template=self.book_template,
+            lock=lock,
         )
 
     def toggle_engine(self):
@@ -610,6 +618,7 @@ class WatcherApp:
                 self.log(msg, level="ERROR")
                 messagebox.showwarning("监听线程卡住", msg)
                 return
+            self.release_lock()
             self.btn_engine.config(text="开始监听")
             self.var_status.set("监听已停止")
             self.log("监听线程已停止")
@@ -618,14 +627,36 @@ class WatcherApp:
             messagebox.showwarning("未登录", "请先登录")
             return
         self.save_config()
+
+        # 与命令行监听程序共用同一把单实例锁：不允许两个实例同时打开 Excel 写同一本账
+        lock = cw.SharedLock(self.lock_file)
+        acquired, why = lock.acquire()
+        if not acquired:
+            messagebox.showwarning(
+                "已有实例在运行",
+                f"{why}\n\n请先停止命令行监听程序（或另一个界面），再启动本界面的监听。",
+            )
+            self.log(f"启动监听被拒绝：{why}", level="ERROR")
+            return
+        self.instance_lock = lock
+        self.log(why)
+
         conn = store.open_db(self.db_path)          # 监听线程自己的连接
-        session = self.build_session(conn)
+        session = self.build_session(conn, lock=lock)
         self.engine = GuiEngine(session, interval=self.interval)
         self.engine.start()
         self.btn_engine.config(text="停止监听")
         self.var_status.set("监听中…")
         self.log(f"监听已启动（间隔 {self.interval}s，阈值 {self.threshold}）。"
                  "合同将先进入 SQLite，达到阈值/财年结束/手动请求时才写 xlsx。")
+
+    def release_lock(self) -> None:
+        if self.instance_lock is not None:
+            try:
+                self.instance_lock.release()
+            except Exception:  # noqa: BLE001
+                pass
+            self.instance_lock = None
 
     # ==================== 杂项 ====================
     def open_books_dir(self):
@@ -681,6 +712,7 @@ class WatcherApp:
         try:
             if self.engine is not None:
                 self.engine.stop()
+            self.release_lock()
         finally:
             if self._logging_handler is not None:
                 logging.getLogger("contract_watcher").removeHandler(self._logging_handler)

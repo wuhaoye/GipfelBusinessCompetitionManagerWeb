@@ -191,10 +191,31 @@ class CollectorTests(WorkflowTestCase):
         self.assertEqual(store.pending_count(self.conn, 1), 0)
 
 
+class FakeLock:
+    """单实例锁替身：只统计心跳次数。"""
+
+    def __init__(self):
+        self.beats = 0
+
+    def heartbeat(self):
+        self.beats += 1
+
+
 class TriggerTests(WorkflowTestCase):
     def _seed_pending(self, count, company_id=1):
         for i in range(1, count + 1):
             store.upsert_contract(self.conn, make_contract(i, company_id=company_id), company_id)
+
+    def test_lock_is_heartbeaten_during_flush(self):
+        """长批次（一次 Excel 会话可能几分钟）期间必须刷新单实例锁心跳。"""
+        self._seed_pending(2)
+        lock = FakeLock()
+        session = self._session(FakeWorkflowBackend(), threshold=2, lock=lock)
+        session.check_thresholds()
+        self.assertGreaterEqual(lock.beats, 1, "记账期间必须刷新锁心跳，否则锁会被别的实例接管")
+        # 正常结束时也刷一次（run_round 末尾）
+        session.run_round()
+        self.assertGreaterEqual(lock.beats, 2)
 
     def test_threshold_trigger_writes_once(self):
         self._seed_pending(3)

@@ -59,11 +59,12 @@ class BatchTestCase(unittest.TestCase):
 
         return factory
 
-    def _flush(self, registry=None, book=None, factory=None, trigger="threshold"):
+    def _flush(self, registry=None, book=None, factory=None, trigger="threshold", **kwargs):
         return bookkeeping.flush_company(
             self.conn, 1, trigger=trigger, books_dir=self.books_dir,
             registry={} if registry is None else registry,
             book_factory=factory or self._factory(book),
+            **kwargs,
         )
 
 
@@ -189,6 +190,28 @@ class BatchWriteTests(BatchTestCase):
         self._flush(registry={"demo": lambda c, x: None}, trigger="manual")
         row = store.last_batch(self.conn, 1)
         self.assertEqual(row["trigger"], "manual")
+
+    def test_progress_callback_refreshes_lock_during_long_batch(self):
+        """一次 Excel 会话可能几分钟：每个合同 + 保存前都要刷心跳（否则锁被判过期接管）。"""
+        for i in (1, 2, 3):
+            store.upsert_contract(self.conn, make_contract(i, company_id=1), 1)
+
+        def handler(contract, ctx):
+            ctx["add_entries"](add=1, minus=0, number="N", about="a")
+
+        beats: list[int] = []
+        result = self._flush(
+            registry={"demo": handler}, book=FakeBook(),
+            on_progress=lambda: beats.append(1),
+        )
+        self.assertEqual(result.status, "success")
+        self.assertEqual(len(beats), 1 + 3 + 1, "开始 + 每份合同 + 保存前各一次心跳")
+
+    def test_progress_callback_used_on_no_handler_path_too(self):
+        store.upsert_contract(self.conn, make_contract(1, company_id=1), 1)
+        beats: list[int] = []
+        self._flush(registry={}, on_progress=lambda: beats.append(1))
+        self.assertGreaterEqual(len(beats), 1, "不打开 Excel 的分支也要刷一次心跳")
 
 
 class AutoDefaultHandlerTests(BatchTestCase):

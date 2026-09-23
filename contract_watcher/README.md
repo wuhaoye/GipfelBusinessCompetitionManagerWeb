@@ -16,6 +16,7 @@
 | `store.py` | **SQLite 存储层**：按 companyId 分账的合同库、公司目录与记账目标、批次、手动请求、财年缓存、游标 |
 | `bookkeeping.py` | **批量记账**：某公司积压合同 → 一次 Excel 会话调用 `shang.py` 的 add_* |
 | `gui.py` | **Tkinter 窗口**：登录、选择公司、手动记账、按公司查看 SQLite 里的合同 |
+| `start_gui.bat` | **图形界面启动脚本**（Windows）：自动挑选带 tkinter/xlwings 的 Python、缺 xlwings 时告警、失败时暂停显示报错 |
 | `watcher_config.py` | 本地配置（默认 `config.json`）：服务器/账号、阈值、记账目标、账本路径等 |
 | `handlers.py` | **处理函数文件**（自动维护：新类型自动追加默认函数、类型改名自动改名） |
 | `readable.py` | **翻译模块**：合同 payload → 可理解的中文记录；支持按类型注册自定义翻译器 |
@@ -109,9 +110,20 @@ def handle_material_procurement_passed(contract: dict, ctx: dict) -> None:
 ### 5. 图形界面（Tkinter）
 
 ```powershell
+# Windows：双击 / 命令行启动脚本（推荐，自动挑选带 tkinter+xlwings 的 Python）
+start_gui.bat
+start_gui.bat -w            # 无控制台窗口（pythonw）
+start_gui.bat --config my.json
+
+# 直接调用
 python contract_watcher.py --gui        # 或
 python gui.py
 ```
+
+`start_gui.bat` 做的事：切到本目录 → 按 `py -3` → `python` 顺序挑一个**带 tkinter**
+的解释器（优先同时有 xlwings 的，缺 xlwings 只告警不拦截）→ 运行 `gui.py`，
+失败时 `pause` 保留报错。文件本身是**纯 ASCII + CRLF**（cmd 按 OEM 代码页读字节，
+中文注释会乱码；与本仓库 `scripts/*.bat` 同一约定）。
 
 界面分四块：**① 登录**（服务器/账号/密码/比赛 id）；**② 公司**（只列有管理权限的公司，
 勾选=记账目标，显示待记账/已记账/最近记账）；**③ 合同**（选中公司在 SQLite 里的合同，
@@ -120,6 +132,9 @@ python gui.py
 
 - 「立即记账」= 手动请求：监听在跑时排队给监听线程处理（保证 Excel 单线程），
   没在跑时用后台线程直接执行一次；
+- **单实例**：启动监听前会取 `data/watcher.lock`（与命令行 `--lock-file` 同一把锁），
+  命令行监听程序或另一个界面在跑时会被明确拒绝——避免两个进程同时打开 Excel 写同一本账；
+  停止监听/关闭窗口会释放；长批次（几分钟的 Excel 会话）期间由记账回调持续刷新锁心跳；
 - 监听线程会显示「已完成 N 轮」；若超过 120 秒无进展，状态栏提示
   「可能卡在 Excel/COM」（Excel 卡死无法从 Python 安全强杀，请结束后重启监听）；
 - 公司勾选与阈值会写回 `config.json`（密码只有勾选「记住密码」才落盘）。
@@ -165,11 +180,14 @@ python contract_watcher.py --server ... --username ... --password ... --backfill
 
 # 图形界面（登录 / 选公司 / 手动记账 / 查看合同）：
 python contract_watcher.py --gui
+# Windows 上更省事：双击或执行启动脚本（自动挑 Python、缺 xlwings 会告警）
+start_gui.bat
 ```
 
 - 默认每 3 秒检查一次（`--interval 1` 可更实时）；
 - 首次运行建立进度基线：之后**新通过**的合同才会被处理；
-- 单实例：重复启动会被端口锁拒绝（`--port` 可换）；
+- 单实例：重复启动会被端口锁拒绝（`--port` 可换）；**图形界面启动监听**与命令行
+  监听程序共用 `data/watcher.lock`，两者不会同时打开 Excel 写同一本账；
 - 记账不再随合同执行：合同先进 `data/watcher.db`，达阈值（默认 10 条）/财年结束/
   手动请求时才写 `books/company_<id>.xlsx`（详见上面的「新工作流」）。
 
