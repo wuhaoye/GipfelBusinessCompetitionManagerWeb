@@ -92,9 +92,14 @@ SKIP_INSTALL_DEPS=0
 FORCE_OVERWRITE=0
 PUBLIC_IP=""   # 显式指定公网 IP（无域名纯 IP 部署日志查看器用）；非空则跳过自动探测与交互填写
 PUBLIC_IP_SET=0  # 标记 --public-ip 是否由用户显式传入（用于结尾提示区分「用户指定」与「自动探测」）
-# 审计 X-22：改前脚本把 SEED_ADMIN_PASSWORD **明文**写进 stdout（生成处 + 结尾摘要），
+# 审计 X-22 + 运维可用性：改前脚本把 SEED_ADMIN_PASSWORD **明文**无条件写进 stdout，
 # 部署若被 `| tee deploy.log`、CI 捕获、screen/tmux 回滚缓冲或堡垒机命令记录留存，
-# 拿到日志的人就能在管理员首次登录前直接以 admin 接管系统。默认不再打印。
+# 拿到日志的人就能在管理员首次登录前直接以 admin 接管系统。
+# 现行口径（两侧打印都遵守）：
+#   · stdout 是**交互终端**（`-t 1`）→ 直接显示口令，省去运维再去 grep .env；
+#   · stdout 不是终端（管道 / CI / 重定向）→ 绝不打印，只给查看命令 —— 日志里不留明文。
+# `--print-seed-password` 为历史兼容开关：终端下本就显示，它已不再影响是否打印
+# （非终端下也不会因它而泄露）。
 PRINT_SEED_PASSWORD=0
 LV_PUBLIC_IP=""  # 预初始化：set -u 下 DJANGO_ALLOWED_HOSTS 自愈块可能在其未赋值时引用（如 .env 已存在且无需纠正）
 # HTTPS via Cloudflare Origin Certificate（--origin-cert）
@@ -128,8 +133,9 @@ Usage: $0 [options]
   --no-logviewer-tls           关闭上述端口块（用于改用 log.<域名> 子域形态的部署）
   --skip-install-deps          跳过 apt install（已知环境已装好）
   --force-overwrite            即使 INSTALL_DIR 存在也覆盖（保留 backup）
-  --print-seed-password        在**交互终端**（stdout 为 TTY）上显示初始管理员口令；
-                               默认不显示，请自行 `sudo grep ^SEED_ADMIN_PASSWORD= <安装目录>/backend/.env`
+  --print-seed-password        历史兼容开关（终端下本就默认显示初始管理员口令）；
+                               口令只在 stdout 为 TTY 时打印，管道/CI/重定向下绝不打印，
+                               此时请自行 `sudo grep ^SEED_ADMIN_PASSWORD= <安装目录>/backend/.env`
   --allow-partial              即使有检查未通过也以退出码 0 结束（默认：有问题即非 0 退出，
                                便于 CI/自动化判定"部署是否真的成功"）
   -h, --help                   显示本帮助
@@ -440,7 +446,7 @@ if [[ ! -f "$INSTALL_DIR/backend/.env" ]]; then
     else
         echo "SEED_ADMIN_PASSWORD=${ADMIN_PW}" >> "$INSTALL_DIR/backend/.env"
     fi
-    if [[ "$PRINT_SEED_PASSWORD" == "1" && -t 1 ]]; then
+    if [[ -t 1 ]]; then
         ok "管理员密码已生成：admin / ${ADMIN_PW}（首次登录强制改密）"
     else
         ok "管理员初始密码已生成并写入 ${INSTALL_DIR}/backend/.env 的 SEED_ADMIN_PASSWORD（首次登录强制改密）"
@@ -684,8 +690,13 @@ cp -f "$_tmp_unit" /etc/systemd/system/gipfel-logviewer.service
 rm -f "$_tmp_unit"
 
 systemctl daemon-reload
+# 审计 X-31：改前是 `systemctl enable --now gipfel` —— 对**已在运行**的 unit 这是空操作，
+# 重部署后 daphne 仍是旧进程、后端代码改动完全不生效（真机复现：改完 auth 层重跑部署，
+# 接口行为一字未变，极易被误判成"修复没写对"）。改为 enable + restart：
+# 首次安装时 restart 等价于 start，重部署时强制加载新代码。
 # enable 失败（如 unit 仍被 masked）不能直接中止脚本：交给下方 is-active 检查统一诊断报告
-systemctl enable --now gipfel 2>/dev/null || warn "systemctl enable --now gipfel 失败（unit 可能仍被 masked），详见下方活性检查"
+systemctl enable gipfel 2>/dev/null || warn "systemctl enable gipfel 失败（unit 可能仍被 masked），详见下方活性检查"
+systemctl restart gipfel 2>/dev/null || warn "systemctl restart gipfel 失败，详见下方活性检查"
 sleep 2
 if ! systemctl is-active --quiet gipfel; then
     warn "gipfel 服务未立即激活，等待 5s 重试检查"
@@ -696,7 +707,9 @@ systemctl is-active --quiet gipfel && ok "gipfel.service 运行中" || \
       journalctl -u gipfel -n 30 --no-pager; err "gipfel 服务启动失败，见上方日志"; }
 
 # 日志查看器（独立站点，nginx 子域 log.<DOMAIN> 代理）
-systemctl enable --now gipfel-logviewer 2>/dev/null || warn "systemctl enable --now gipfel-logviewer 失败（unit 可能仍被 masked），详见下方活性检查"
+# 同 X-31：enable --now 对已运行 unit 是空操作，必须 restart 才会加载新代码
+systemctl enable gipfel-logviewer 2>/dev/null || warn "systemctl enable gipfel-logviewer 失败（unit 可能仍被 masked），详见下方活性检查"
+systemctl restart gipfel-logviewer 2>/dev/null || warn "systemctl restart gipfel-logviewer 失败，详见下方活性检查"
 sleep 2
 if ! systemctl is-active --quiet gipfel-logviewer; then
     warn "gipfel-logviewer 服务未立即激活，等待 5s 重试检查"
@@ -1017,14 +1030,15 @@ echo
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 # 读取管理员密码并醒目输出（★ 必须容忍无匹配：首次部署 .env 尚未写入该行时 grep 退出 1，
 #   pipefail 下会让这行赋值失败 → set -e 在脚本最后一步静默终止，看不到任何凭据输出）
-# 审计 X-22（master 合并后重做）：这里曾无条件回显口令 —— 部署日志/CI 输出里
-#   会留下管理员明文。与上方「首次部署生成」处保持同一守卫：
-#   只有「显式 --print-seed-password **且** stdout 是终端」才打印。
+# 审计 X-22（master 合并后重做 → 现行口径）：口令只在 **stdout 为交互终端** 时回显；
+#   管道 / CI / 重定向（`| tee deploy.log` 等）下绝不打印，避免管理员明文进入日志。
+#   与上方「首次部署生成」处保持同一守卫条件（`-t 1`）。
 _SEED_PW="$(grep -E '^SEED_ADMIN_PASSWORD=' "$INSTALL_DIR/backend/.env" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]' | sed -E "s/^['\"]//; s/['\"]$//" || true)"
 if [[ -n "$_SEED_PW" ]]; then
-    if [[ "$PRINT_SEED_PASSWORD" == "1" && -t 1 ]]; then
+    if [[ -t 1 ]]; then
         echo "  👤 管理员账号：admin"
         echo "  🔑 管理员密码：${_SEED_PW}"
+        echo "     （首次登录会强制修改；口令仅在本终端显示，未写入任何日志）"
     else
         echo "  👤 管理员账号：admin"
         echo "  🔑 管理员密码：见 ${INSTALL_DIR}/backend/.env 的 SEED_ADMIN_PASSWORD"
@@ -1035,7 +1049,6 @@ if [[ -n "$_SEED_PW" ]]; then
 else
     echo "  🔑 管理员密码：见 ${INSTALL_DIR}/backend/.env 的 SEED_ADMIN_PASSWORD"
     echo "     查看命令：sudo grep '^SEED_ADMIN_PASSWORD=' ${INSTALL_DIR}/backend/.env"
-    echo "     （如需在本终端直接显示，可加 --print-seed-password 重跑）"
 fi
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo

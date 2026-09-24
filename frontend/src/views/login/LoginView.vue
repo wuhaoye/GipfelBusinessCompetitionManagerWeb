@@ -101,6 +101,8 @@ async function handleLogin() {
       await authStore.login(form.username, form.password);
       // 命中强制改密策略（默认超管首次登录）：弹窗改密，不进入业务界面
       if (authStore.needsPasswordChange) {
+        // 预填刚输入的初始密码：改密表单的「原密码」就是它，省一次手输也避免输错
+        changeForm.oldPassword = form.password;
         showChangeDialog.value = true;
         return;
       }
@@ -144,7 +146,8 @@ async function submitChangePassword() {
   }
   changeForm.changing = true;
   try {
-    await authStore.changePassword(changeForm.oldPassword, changeForm.newPassword);
+    // 第三个参数带上用户名：万一登录态已被清空（历史缺陷），store 能用它 + 原密码恢复会话
+    await authStore.changePassword(changeForm.oldPassword, changeForm.newPassword, form.username);
     ElMessage.success("密码修改成功");
     showChangeDialog.value = false;
     router.push("/dashboard");

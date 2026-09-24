@@ -62,13 +62,23 @@ def exception_handler(exc, context):
 
     # DRF 默认异常（权限/认证/校验）
     message = _drf_message(exc, response)
-    return _wrap(response.status_code, message)
+    return _wrap(response.status_code, message, _machine_code(response.status_code, exc))
 
 
-def _wrap(code: int, message: str):
+def _wrap(code: int, message: str, error_code: str | None = None):
     from rest_framework.response import Response
 
-    return Response(error(code, message, None), status=_http_status(code))
+    return Response(error(code, message, None, error_code), status=_http_status(code))
+
+
+def _machine_code(status_code: int, exc) -> str | None:
+    """提取 401 认证异常的机器可读 code（改前被整体丢弃，前端只能按中文文案猜语义）。"""
+    if status_code != 401:
+        return None
+    codes = exc.get_codes() if hasattr(exc, "get_codes") else None
+    if isinstance(codes, str) and codes != "authentication_failed":
+        return codes
+    return None
 
 
 def _http_status(code: int) -> int:

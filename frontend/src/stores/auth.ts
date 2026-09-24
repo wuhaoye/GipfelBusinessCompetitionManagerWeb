@@ -69,10 +69,17 @@ export const useAuthStore = defineStore("auth", () => {
    *  返回 401「未跑 bcrypt」，本质是同连接上 User 实例偶发读到旧 / 空 password_hash）。
    *  同时在改密→续接窗口期：停掉心跳、屏蔽 401 拦截器的踢出逻辑——
    *  旧会话后台请求（心跳/缓存同步）的迟到 401 不得清掉刚换发的新 token。 */
-  async function changePassword(oldPassword: string, newPassword: string) {
+  async function changePassword(oldPassword: string, newPassword: string, username?: string) {
     stopHeartbeat();
     setSessionRefreshing(true);
     let changed = false;
+    // 登录态可能已被清空（历史缺陷：门禁 401 被当成会话过期 → token/user 一起被 logout 清掉）。
+    // 此时直接用「用户名 + 用户刚输入的旧密码」恢复登录态，否则改密请求不带 Authorization，
+    // 后端只会返回「登录已过期，请重新登录」。
+    const loginName = user.value?.username || username || "";
+    if (!token.value && loginName) {
+      await login(loginName, oldPassword);
+    }
     try {
       try {
         const res: any = await authApi.changePassword({ oldPassword, newPassword });
@@ -96,8 +103,9 @@ export const useAuthStore = defineStore("auth", () => {
         // 用用户刚输入的旧密码静默重登换新 token（单设备设计 = 本机接管会话），再重试一次。
         // 注意：旧密码输错走 400「旧密码不正确」，不会进入此分支；重登失败则原样抛出。
         const status = e?.response?.status;
-        if (status === 401 && user.value?.username) {
-          await login(user.value.username, oldPassword);
+        const retryName = user.value?.username || loginName;
+        if (status === 401 && retryName) {
+          await login(retryName, oldPassword);
           // 重登后再次改密——重登时后端会递增一次 token_version，
           // 此处不再依赖改密响应里的 token（按登录路径续接），保持向后兼容。
           await authApi.changePassword({ oldPassword, newPassword });
@@ -167,6 +175,10 @@ export const useAuthStore = defineStore("auth", () => {
   function startHeartbeat() {
     stopHeartbeat(); // 避免重复启动
     if (!token.value) return;
+    // 强制改密期间不启动心跳：门禁下 /auth/me 曾被拒（401），心跳的 401 会被全局拦截器
+    // 误判成「会话过期」而清掉 token，用户提交改密即报「登录已过期」（真机事故）。
+    // 后端现已把 /auth/me 列入豁免，这里再保一层：改密成功后再由 changePassword 启动心跳。
+    if (user.value?.mustChangePassword) return;
     heartbeatTimer = window.setInterval(async () => {
       if (!token.value) {
         stopHeartbeat();

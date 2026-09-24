@@ -386,7 +386,13 @@ if [[ ! -f "$INSTALL_DIR/backend/.env" ]]; then
         echo 'DEBUG=false' >> "$INSTALL_DIR/backend/.env"
     fi
     warn "已生成 .env；公网访问入口（DJANGO_ALLOWED_HOSTS/CORS/CSRF）将在下方自愈块按域名/公网 IP 补全"
-    warn "默认管理员密码已自动生成，请查看 .env 中的 SEED_ADMIN_PASSWORD（首次登录后强制修改）"
+    # 审计 X-22 + 运维可用性：终端下直接显示口令；非终端（管道/CI/重定向）绝不打印，
+    # 只指向 .env，避免管理员明文进入日志。
+    if [[ -t 1 ]]; then
+        warn "默认管理员密码已自动生成：admin / ${ADMIN_PW}（首次登录强制改密；仅在本终端显示，不写入日志）"
+    else
+        warn "默认管理员密码已自动生成，请查看 .env 中的 SEED_ADMIN_PASSWORD（首次登录后强制修改）"
+    fi
 fi
 log "更新后端（pip / migrate / collectstatic）"
 # 审计 X-07：降级（--allow-stale-code 且 pull 失败）时，写库结构变更属于高风险操作 ——

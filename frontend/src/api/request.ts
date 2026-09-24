@@ -127,6 +127,15 @@ api.interceptors.response.use(
       return Promise.reject(error);
     }
     if (error.response?.status === 401) {
+      // 后端「强制改密」门禁（errorCode=must_change_password）**不是**会话过期：绝不能清 token、
+      // 不能跳登录页、不能派发 auth:kicked —— 否则用户正在填写的「修改初始密码」表单会因为
+      // 登录态被清空而提交成匿名请求，后端返回「登录已过期，请重新登录」（真机事故：
+      // 新部署的超管永远改不了初始密码，等于被挡在门外）。
+      // 注：必须用 errorCode（后端 401 的机器码）而不是 data.code —— 后者是 HTTP 状态码 401。
+      if (error.response?.data?.errorCode === "must_change_password") {
+        if (!error.config?.silent) ElMessage.warning(getErrorMessage(error));
+        return Promise.reject(error);
+      }
       // 会话刷新窗口（改密自动重登中）：旧会话的 401 一律静默丢弃，不踢出、不弹提示
       if (isSessionRefreshing()) {
         return Promise.reject(error);

@@ -2,7 +2,7 @@
 
 - HS256 签名 + issuer/audience 校验（与原 jwt.module 配置一致）
 - 校验 tokenVersion（顶号下线：payload.tv ≠ user.token_version → 401）
-- 强制改密拦截：must_change_password=true 时除改密接口外全部拒绝
+- 强制改密拦截：must_change_password=true 时除「改密」与「读自身资料」外全部拒绝
 - 暴露 decode_jwt_payload（供 OperatorContextMiddleware 注入上下文，失败不阻断）
 - 暴露 create_jwt（供 LoginView 签发）
 """
@@ -19,8 +19,16 @@ logger = logging.getLogger("gipfel")
 
 _ALGORITHM = "HS256"
 
-# 强制改密放行路径（仅改密接口允许在 must_change_password=true 时通过）
-_CHANGE_PASSWORD_PATHS = ("/api/auth/change-password",)
+# 强制改密放行路径：must_change_password=true 时仅以下接口允许通过。
+# · change-password：改密本身。
+# · me：前端「修改初始密码」弹窗与 20s 会话心跳都要读自己的资料（只读自身信息，
+#   不放大任何业务权限）。改前未放行 → 心跳打 /api/auth/me 收到 401，被前端全局 401
+#   拦截器当成「会话过期」清掉 token，用户随后提交改密必然报「登录已过期」
+#   （真机事故：新部署的超管永远改不了初始密码，等于无法登录）。
+_CHANGE_PASSWORD_PATHS = (
+    "/api/auth/change-password",
+    "/api/auth/me",
+)
 
 
 # ==================== Token 编解码 ====================
@@ -158,6 +166,6 @@ class JWTAuthentication(authentication.BaseAuthentication):
 
 
 def _is_change_password_endpoint(request) -> bool:
-    """判断当前请求是否指向改密接口（路径尾匹配，兼容 include 前缀）。"""
+    """判断当前请求是否落在「强制改密期间仍需放行」的路径上（尾匹配，兼容 include 前缀）。"""
     path = request.path or ""
     return path.endswith(_CHANGE_PASSWORD_PATHS)

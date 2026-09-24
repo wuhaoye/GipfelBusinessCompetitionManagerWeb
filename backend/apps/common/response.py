@@ -51,9 +51,19 @@ def success(data=None, message: str = "成功"):
     return {"code": 0, "message": message, "data": data}
 
 
-def error(code: int, message: str, data=None):
-    """构造错误响应体（供异常处理器使用）。"""
-    return {"code": code, "message": message, "data": data}
+def error(code: int, message: str, data=None, error_code: str | None = None):
+    """构造错误响应体（供异常处理器使用）。
+
+    `error_code`：机器可读的稳定标识（取自 DRF 异常的 code，如 `must_change_password` /
+    `token_version_mismatch` / `expired`）。前端据此区分语义——例如「必须先改密」与
+    「会话已过期」都是 401，只靠中文文案判断既脆弱又容易误报（真机事故：强制改密门禁的
+    401 被前端当成会话过期，清掉 token 后改密必然报「登录已过期」）。
+    该字段为**增量**字段，老前端忽略它即可。
+    """
+    body = {"code": code, "message": message, "data": data}
+    if error_code:
+        body["errorCode"] = error_code
+    return body
 
 
 def _is_wrapped(data) -> bool:
