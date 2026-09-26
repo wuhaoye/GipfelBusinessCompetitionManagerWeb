@@ -1,6 +1,6 @@
 # Gipfel 商赛系统 · 服务器迁移指南
 
-将 Gipfel 服务从一台服务器完整迁移到另一台服务器的操作手册。部署步骤见 [`deploy/README.md`](deploy/README.md)；运维命令见 [`OPS.md`](OPS.md)。
+将 Gipfel 服务从一台服务器完整迁移到另一台服务器的操作手册。部署步骤见 [`deploy/README.md`](../deploy/README.md)；运维命令见 [`OPS.md`](OPS.md)。
 
 ---
 

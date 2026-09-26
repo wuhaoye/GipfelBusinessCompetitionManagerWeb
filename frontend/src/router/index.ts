@@ -225,6 +225,14 @@ const router = createRouter({
           meta: { title: "审计日志", requiresSuperAdmin: true },
         },
         {
+          path: "snapshots",
+          name: "Snapshots",
+          component: () => import("@/views/system/SnapshotManageView.vue"),
+          // 快照/回退会读写全库并强制暂停全体用户，后端要求 snapshot:view（超管专属），
+          // 前端同步收紧为超管可见。
+          meta: { title: "快照与回退", requiresSuperAdmin: true, requiresPermission: "snapshot:view" },
+        },
+        {
           path: "companies",
           name: "Companies",
           component: () => import("@/views/companies/CompanyListView.vue"),

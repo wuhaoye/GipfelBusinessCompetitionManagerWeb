@@ -9,8 +9,16 @@ from django.urls import include, path, re_path
 from django.views.static import serve as static_serve
 
 from apps.auth.views import HealthView, VersionView
+from apps.realtime.internal import internal_emit_view
 
 urlpatterns = [
+    # C1-a 内部实时转发端点（hub 进程受理 WSGI 端转发）：仅回环 + 共享令牌鉴权，
+    # 路径固定为 settings.REALTIME_INTERNAL_PATH；nginx 不代理 /_internal/，公网不可达。
+    path(
+        getattr(settings, "REALTIME_INTERNAL_PATH", "/_internal/realtime/emit").lstrip("/"),
+        internal_emit_view,
+        name="realtime-internal-emit",
+    ),
     # 管理后台（Django admin）：仅用于临时排查/修数，业务管理仍走前端 Vue 界面
     path("admin/", admin.site.urls),
     # 健康检查与版本（无鉴权，对应原 health.controller / version.controller）
@@ -46,6 +54,8 @@ urlpatterns = [
     path("api/", include("apps.widget_packages.urls")),
     # 比赛准备总览与归档导出（只读；需 competition:manage）
     path("api/", include("apps.preparation.urls")),
+    # 快照与回退（全量记录 + 强制暂停 + 及时回退；需 snapshot:view/manage/restore，均超管专属）
+    path("api/", include("apps.snapshots.urls")),
 ]
 
 # /uploads 静态托管（CORP cross-origin 由中间件设置）

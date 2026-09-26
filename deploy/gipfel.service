@@ -11,10 +11,24 @@ Group=gipfel
 
 # 工作目录 = backend 根目录（manage.py 所在目录）
 WorkingDirectory=__INSTALL_DIR__/backend
+# ★ 顺序有语义：`Environment=` 写默认值，`EnvironmentFile=`（backend/.env）在后。
+#   systemd 中 EnvironmentFile 的值**优先级更高**，所以 .env 里写一行就能覆盖这里的默认值
+#   （unit 在仓库里，升级会被覆盖；.env 不动，是给运维留的覆盖入口）。
 Environment="PATH=__INSTALL_DIR__/backend/.venv/bin"
+# C1-a：本进程是**唯一**持有 Socket.IO 连接与进程内事件环的进程，故以 hub 身份运行
+# （额外开放 `/_internal/realtime/emit` 转发端点，由 WSGI 侧的 gipfel-wsgi.service 调用；
+#  仅接受回环来源 + 内部令牌，见 docs/运维约束整改设计说明.md §2）。
+# 单进程部署（C1-a 未启用、只有本 unit 时）该值无副作用：hub ≡ local，仍等价改造前行为。
+# 若要改用 Redis 总线：在 backend/.env 写 REALTIME_BUS=redis + REALTIME_REDIS_URL（两个 unit 一起生效）。
+Environment="REALTIME_BUS=hub"
 EnvironmentFile=-__INSTALL_DIR__/backend/.env
 
 # 启动 daphne：HTTP + Socket.IO 同源同端口，只绑回环，由 nginx 反代
+#
+# C1-a：nginx 现已把 `/api/`、`/admin/` 反代到 gunicorn（`gipfel-wsgi.service`，127.0.0.1:8002），
+# 只把 `/socket.io/` 反代到本进程。这里**仍然**监听完整 Django（`backend.asgi:application`）
+# 且保持 `-b 127.0.0.1 -p 8000` 不变—— :8000 上的 /api/* 仍可用（回环兼容），
+# 部署脚本的健康检查与 :8000 直连消费者（contract_watcher 等）因此不受影响。
 #
 # 审计 X-23：改前这里同时监听 Unix socket `/run/gipfel/gipfel.sock`（`-u`）。
 # 全仓库检索确认**没有任何消费方**——nginx 走的是 `127.0.0.1:8000`
@@ -66,7 +80,8 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 CapabilityBoundingSet=
 # 审计 X-13：这里只保留主应用真正需要可写的路径。
 # （注意：两服务同用户，故文件属主权限是主要边界，本行是 systemd 沙箱侧的显式白名单。）
-ReadWritePaths=__INSTALL_DIR__/backend/uploads __INSTALL_DIR__/backend/logs __INSTALL_DIR__/backend/db.sqlite3 /run/gipfel /var/log/gipfel
+# snapshots/ 为快照归档目录（apps.snapshots）：缺失会导致回退/快照写入 PermissionError。
+ReadWritePaths=__INSTALL_DIR__/backend/uploads __INSTALL_DIR__/backend/logs __INSTALL_DIR__/backend/snapshots __INSTALL_DIR__/backend/db.sqlite3 /run/gipfel /var/log/gipfel
 
 [Install]
 WantedBy=multi-user.target

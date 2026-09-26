@@ -287,6 +287,7 @@ DATA_ITEMS=(
 # 需要迁移的配置文件
 CONFIG_ITEMS=(
     "deploy/gipfel.service"
+    "deploy/gipfel-wsgi.service"   # C1-a：gunicorn(WSGI) 的 unit，缺它 /api/ 会 502
     "deploy/logviewer.service"
     "deploy/nginx-gipfel.conf"
 )
@@ -377,7 +378,10 @@ if [[ "$MODE" == "push" ]]; then
             # 运行用户/组已在 [5/6] 步确保存在（审计 X-30：建用户移到 chown 之前，此处不再重复）
 
             # 安装 systemd 服务
+            # C1-a：三个 unit 都要装 —— 少了 gipfel-wsgi.service，nginx 的准 upstream
+            # gipfel_django(:8002) 会指向空气，/api/ 全 502（daphne 只在 :8000 回环上兜底）。
             sudo cp '$INSTALL_DIR/deploy/gipfel.service' /etc/systemd/system/
+            sudo cp '$INSTALL_DIR/deploy/gipfel-wsgi.service' /etc/systemd/system/
             sudo cp '$INSTALL_DIR/deploy/logviewer.service' /etc/systemd/system/
             sudo systemctl daemon-reload
 
@@ -405,11 +409,12 @@ if [[ "$MODE" == "push" ]]; then
             echo '   sudo nginx -t && sudo systemctl reload nginx'
             echo ''
             echo '4. 启动服务：'
-            echo '   sudo systemctl enable gipfel gipfel-logviewer'
-            echo '   sudo systemctl start gipfel gipfel-logviewer'
+            echo '   sudo systemctl enable gipfel gipfel-wsgi gipfel-logviewer'
+            echo '   sudo systemctl start gipfel gipfel-wsgi gipfel-logviewer'
             echo ''
-            echo '5. 验证：'
-            echo '   curl http://127.0.0.1:8000/api/health'
+            echo '5. 验证（C1-a：两个后端进程都要在）：'
+            echo '   curl http://127.0.0.1:8002/api/health                                  # WSGI(gunicorn)'
+            echo '   curl \"http://127.0.0.1:8000/socket.io/?EIO=4&transport=polling\"        # daphne(ASGI) 期望 200'
             echo ''
         "
     else
@@ -541,8 +546,9 @@ elif [[ "$MODE" == "pull" ]]; then
             sudo chown -R gipfel:gipfel "$INSTALL_DIR/backend"
             sudo chmod 600 "$INSTALL_DIR/backend/.env" 2>/dev/null || true
 
-            # 安装 systemd 服务
+            # 安装 systemd 服务（C1-a：daphne + gunicorn WSGI 两个后端 unit，缺一会让 /api/ 502）
             sudo cp "$INSTALL_DIR/deploy/gipfel.service" /etc/systemd/system/
+            sudo cp "$INSTALL_DIR/deploy/gipfel-wsgi.service" /etc/systemd/system/
             sudo cp "$INSTALL_DIR/deploy/logviewer.service" /etc/systemd/system/
             sudo systemctl daemon-reload
         fi
@@ -563,7 +569,7 @@ elif [[ "$MODE" == "pull" ]]; then
     log_info "1. 安装 Python 依赖: cd $INSTALL_DIR/backend && python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt"
     log_info "2. 运行迁移: python manage.py migrate && python manage.py collectstatic --noinput"
     log_info "3. 配置 nginx: 参考 deploy/README.md"
-    log_info "4. 启动服务: sudo systemctl enable gipfel gipfel-logviewer && sudo systemctl start gipfel gipfel-logviewer"
+    log_info "4. 启动服务: sudo systemctl enable gipfel gipfel-wsgi gipfel-logviewer && sudo systemctl start gipfel gipfel-wsgi gipfel-logviewer"
 fi
 
 log_info ""

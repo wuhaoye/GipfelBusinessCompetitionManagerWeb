@@ -6,6 +6,8 @@ Django 设置模块。
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import os
 from pathlib import Path
 
@@ -172,6 +174,27 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR", "./uploads"))
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
+# ==================== 快照与回退（apps.snapshots） ====================
+# 归档目录：每份快照一个子目录（manifest.json + tables/*.jsonl.gz + files/）
+SNAPSHOT_DIR = Path(os.environ.get("SNAPSHOT_DIR", str(BASE_DIR / "snapshots")))
+SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+# 门禁状态进程内缓存秒数（多进程部署时其它进程的变更最多滞后这么久）
+SNAPSHOT_GATE_CACHE_SECONDS = float(os.environ.get("SNAPSHOT_GATE_CACHE_SECONDS", "1"))
+# 强制暂停时等待「在途写请求」排空的上限（秒），超时则暂停操作失败（数据不变）
+SNAPSHOT_DRAIN_TIMEOUT = float(os.environ.get("SNAPSHOT_DRAIN_TIMEOUT", "10"))
+# 回退中状态的兜底 TTL（秒）：进程崩溃时不至于永久停在「回退中」
+SNAPSHOT_RESTORE_TTL_SECONDS = int(os.environ.get("SNAPSHOT_RESTORE_TTL_SECONDS", "900"))
+# 手动暂停的默认 TTL（0 = 不自动恢复，需管理员显式恢复）
+SNAPSHOT_PAUSE_TTL_SECONDS = int(os.environ.get("SNAPSHOT_PAUSE_TTL_SECONDS", "0"))
+# 上传文件归档总量上限（字节），超过则跳过剩余文件并在快照里记录提示
+SNAPSHOT_MAX_FILE_BYTES = int(
+    os.environ.get("SNAPSHOT_MAX_FILE_BYTES", str(2 * 1024 * 1024 * 1024))
+)
+# 单次下载打包上限（字节）
+SNAPSHOT_DOWNLOAD_MAX_BYTES = int(
+    os.environ.get("SNAPSHOT_DOWNLOAD_MAX_BYTES", str(256 * 1024 * 1024))
+)
+
 # CORS（未配置时仅本地/私网反射并带凭据，公网须白名单）
 CORS_ORIGIN = os.environ.get("CORS_ORIGIN", "").strip()
 
@@ -259,6 +282,7 @@ INSTALLED_APPS = [
     "apps.announcements",
     "apps.widget_packages",
     "apps.preparation",
+    "apps.snapshots",
 ]
 
 MIDDLEWARE = [
@@ -267,6 +291,9 @@ MIDDLEWARE = [
     "apps.common.middleware.SecurityHeadersMiddleware",
     "apps.common.middleware.OperatorContextMiddleware",
     "apps.common.middleware.LoginRateLimitMiddleware",
+    # 快照门禁：处于「强制暂停 / 回退中」时拒绝业务写入（HTTP 423），
+    # 把在途写请求计入计数器供排空使用。白名单端点见 apps/snapshots/middleware.py。
+    "apps.snapshots.middleware.SnapshotGateMiddleware",
     "django.middleware.security.SecurityMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     # 后端管理后台防直连网关：仅 /admin/* 受控，缺失/无效令牌则 302 重定向回前端 SPA。
@@ -301,13 +328,139 @@ WSGI_APPLICATION = "backend.wsgi.application"
 ASGI_APPLICATION = "backend.asgi.application"
 
 
-# ==================== 数据库 ====================
+# ==================== 数据库（C2 阶段 1：SQLite 调优） ====================
+# 背景（见《架构性运维约束整改简报.md》C2）：默认回滚日志（journal_mode=delete）+
+# sqlite3 默认 busy_timeout=5000ms，写并发一高就抛 "database is locked"。
+#
+# 改法分两层（Django 5.0 的 sqlite3 后端**只认** sqlite3.connect() 的形参，
+# 没有 init_command/transaction_mode：见 django/db/backends/sqlite3/base.py
+# get_connection_params()，OPTIONS 会被原样 **kwargs 传给 sqlite3.connect）：
+#   ① OPTIONS["timeout"]      → sqlite3 的锁等待秒数（即 PRAGMA busy_timeout = timeout*1000）
+#   ② connection_created 信号 → 对**每条**新连接执行 PRAGMA（WAL / synchronous / busy_timeout）
+#      实现见 apps/common/db_pragmas.py（由 apps/common/apps.py 的 ready() 接线）。
+# 单靠 OPTIONS 无法开 WAL，单靠信号也要每个连接都跑一遍——两者缺一不可。
+#
+# ⚠️ WAL 依赖共享内存与文件锁，**数据库必须位于本地磁盘**（网络盘/NFS/容器挂载卷上
+#    可能不可用甚至损坏）。部署前确认；如需退回，设 SQLITE_JOURNAL_MODE=DELETE 即可。
+_ENV_TRUE = {"1", "true", "yes", "on"}
+
+#: 是否启用 SQLite PRAGMA 调优（关闭后行为与改造前完全一致，便于现场快速回退）
+SQLITE_TUNING_ENABLED = (
+    os.environ.get("SQLITE_TUNING_ENABLED", "true").strip().lower() in _ENV_TRUE
+)
+#: 日志模式：WAL（推荐）| DELETE | TRUNCATE | PERSIST | MEMORY | OFF
+SQLITE_JOURNAL_MODE = os.environ.get("SQLITE_JOURNAL_MODE", "WAL").strip().upper()
+#: 同步级别：NORMAL（WAL 下的推荐值）| FULL | OFF | EXTRA
+SQLITE_SYNCHRONOUS = os.environ.get("SQLITE_SYNCHRONOUS", "NORMAL").strip().upper()
+#: 锁等待毫秒数（改造前为 sqlite3 默认 5000ms，高并发下频繁抛锁错误）
+SQLITE_BUSY_TIMEOUT_MS = int(os.environ.get("SQLITE_BUSY_TIMEOUT_MS", "20000"))
+SQLITE_WAL_AUTOCHECKPOINT = int(os.environ.get("SQLITE_WAL_AUTOCHECKPOINT", "1000"))
+
+# 白名单校验：这几个值会被拼进 PRAGMA 语句，不接受任意字符串（防配置注入 / 打错字静默失效）
+if SQLITE_JOURNAL_MODE not in {"WAL", "DELETE", "TRUNCATE", "PERSIST", "MEMORY", "OFF"}:
+    raise RuntimeError(
+        f"环境变量校验失败:\n  SQLITE_JOURNAL_MODE: 非法值 {SQLITE_JOURNAL_MODE!r}"
+        "（允许 WAL/DELETE/TRUNCATE/PERSIST/MEMORY/OFF）"
+    )
+if SQLITE_SYNCHRONOUS not in {"OFF", "NORMAL", "FULL", "EXTRA"}:
+    raise RuntimeError(
+        f"环境变量校验失败:\n  SQLITE_SYNCHRONOUS: 非法值 {SQLITE_SYNCHRONOUS!r}"
+        "（允许 OFF/NORMAL/FULL/EXTRA）"
+    )
+if SQLITE_BUSY_TIMEOUT_MS <= 0:
+    raise RuntimeError("环境变量校验失败:\n  SQLITE_BUSY_TIMEOUT_MS: 必须为正整数（毫秒）")
+
 DATABASES = {
     "default": {
         "ENGINE": "django.db.backends.sqlite3",
         "NAME": BASE_DIR / "db.sqlite3",
+        # timeout → sqlite3.connect(timeout=...) → PRAGMA busy_timeout=timeout*1000
+        #
+        # ⚠️ 与 `SQLITE_TUNING_ENABLED` 联动：关掉调优开关时这里**连 OPTIONS 一起撤掉**，
+        # 于是锁等待回到 sqlite3 默认 5s、WAL 也不再下发 —— 现场「一键回退到改造前」只需
+        # 一个开关（AUDIT_HTTP_ERROR_MODE=all 负责审计那一半），不必再去动 OPTIONS。
+        "OPTIONS": (
+            {"timeout": SQLITE_BUSY_TIMEOUT_MS / 1000.0}
+            if SQLITE_TUNING_ENABLED
+            else {}
+        ),
     }
 }
+
+#: 启动时实际下发的 PRAGMA 列表（apps/common/db_pragmas.py 逐条执行并记录日志）
+SQLITE_PRAGMA_STATEMENTS = (
+    f"PRAGMA journal_mode={SQLITE_JOURNAL_MODE}",
+    f"PRAGMA synchronous={SQLITE_SYNCHRONOUS}",
+    f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}",
+    f"PRAGMA wal_autocheckpoint={SQLITE_WAL_AUTOCHECKPOINT}",
+)
+
+
+# ==================== 审计噪声治理（C2 阶段 1） ====================
+# 背景（见简报 C2.1 写放大来源）：改造前**每个 4xx/5xx 都写一行审计**，
+# 100 客户端重连/IP 抖动时 401/403 会淹没 AuditLog 并把 SQLite 写串行放大。
+# log_write（业务写审计）**不受本开关影响**，永远落库。
+#   all     = 与改造前一致（全部落库）
+#   sampled = 5xx 全量落库；4xx 仅按采样率落库 + 始终写文件日志（默认，赛后排查仍可查日志）
+#   off     = 4xx/5xx 都只写文件日志，不落库
+AUDIT_HTTP_ERROR_MODE = os.environ.get("AUDIT_HTTP_ERROR_MODE", "sampled").strip().lower()
+if AUDIT_HTTP_ERROR_MODE not in {"all", "sampled", "off"}:
+    raise RuntimeError(
+        f"环境变量校验失败:\n  AUDIT_HTTP_ERROR_MODE: 非法值 {AUDIT_HTTP_ERROR_MODE!r}"
+        "（允许 all/sampled/off）"
+    )
+AUDIT_HTTP_ERROR_SAMPLE_RATE = float(
+    os.environ.get("AUDIT_HTTP_ERROR_SAMPLE_RATE", "0.05")
+)
+if not 0.0 <= AUDIT_HTTP_ERROR_SAMPLE_RATE <= 1.0:
+    raise RuntimeError(
+        "环境变量校验失败:\n  AUDIT_HTTP_ERROR_SAMPLE_RATE: 必须在 [0, 1] 区间"
+    )
+#: 审计历史保留天数（manage.py audit_archive 的默认值）
+AUDIT_RETENTION_DAYS = int(os.environ.get("AUDIT_RETENTION_DAYS", "7"))
+
+
+# ==================== 实时事件总线（C1-a：HTTP 与 WebSocket 进程分离） ====================
+# 背景（见简报 C1.4）：/api/* 改由多 worker 的 WSGI 承载后，REST 进程里的
+# emit_resource_changed **推不到 daphne 进程里的 socket 连接**（改造前靠「同进程 +
+# run_coroutine_threadsafe」才成立）。因此必须引入跨进程事件总线：
+#
+#   REALTIME_BUS=local   （默认 auto 且无其它配置时的落点）单进程老行为，进程内 deque + loop 投递
+#   REALTIME_BUS=hub     daphne 进程：拥有 socket / 序号 / 环形缓冲，接收并本地投递内部转发
+#   REALTIME_BUS=forward WSGI 进程：把 emit **转发**给 hub（内部回环 HTTP + 共享密钥）
+#   REALTIME_BUS=redis   两端都用 Redis（python-socketio 的 AsyncRedisManager + Redis 序号/环形缓冲）
+#   REALTIME_BUS=auto    有 REALTIME_REDIS_URL → redis；否则 local（零配置 = 与改造前完全一致）
+REALTIME_BUS = os.environ.get("REALTIME_BUS", "auto").strip().lower()
+if REALTIME_BUS not in {"auto", "local", "hub", "forward", "redis"}:
+    raise RuntimeError(
+        f"环境变量校验失败:\n  REALTIME_BUS: 非法值 {REALTIME_BUS!r}"
+        "（允许 auto/local/hub/forward/redis）"
+    )
+#: Redis 连接串（如 redis://127.0.0.1:6379/0）；为空则不用 Redis
+REALTIME_REDIS_URL = os.environ.get("REALTIME_REDIS_URL", "").strip()
+#: hub 的内部转发地址（forward 模式必填，如 http://127.0.0.1:8000）；双端可共用同一份 .env
+REALTIME_FORWARD_URL = os.environ.get("REALTIME_FORWARD_URL", "").strip().rstrip("/")
+#: 单次内部转发的超时（秒）：回环 HTTP，超时只丢弃该事件、绝不阻断业务请求
+REALTIME_FORWARD_TIMEOUT = float(os.environ.get("REALTIME_FORWARD_TIMEOUT", "0.5"))
+#: 重放环形缓冲长度（seq 单调递增，超出即淘汰最旧）
+REALTIME_RING_MAX_LEN = int(os.environ.get("REALTIME_RING_MAX_LEN", "5000"))
+#: 内部转发共享密钥：由 LOGVIEWER_SECRET_KEY 派生（两进程读同一 .env，无需额外配置）
+REALTIME_INTERNAL_TOKEN = hmac.new(
+    LOGVIEWER_SECRET_KEY.encode("utf-8"),
+    b"gipfel-internal-realtime-emit",
+    hashlib.sha256,
+).hexdigest()
+#: 内部转发端点的路径（非 /api 前缀：nginx 不会代理它，公网不可达）
+REALTIME_INTERNAL_PATH = "/_internal/realtime/emit"
+
+
+# ==================== 会话心跳条件请求（C3） ====================
+# /api/auth/me 支持 ETag/If-None-Match（命中即 304 空体）与 ?light=1 轻响应，
+# 用于把 100 客户端 × 20s 的稳态心跳流量降下来（见简报 C3.3）。
+# 关闭后行为与改造前完全一致（始终返回完整资料 + 不校验 If-None-Match）。
+AUTH_ME_CONDITIONAL_ENABLED = (
+    os.environ.get("AUTH_ME_CONDITIONAL_ENABLED", "true").strip().lower() in _ENV_TRUE
+)
 
 
 # ==================== 密码哈希 ====================

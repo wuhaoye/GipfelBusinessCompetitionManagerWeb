@@ -11,13 +11,28 @@ env/
 backend/.deps/
 *.sqlite3
 db.sqlite3
+# SQLite WAL 边车文件（C2 阶段 1 开启 journal_mode=WAL 后必然出现）：纯运行时状态，绝不入库。
+# 注意 `db.sqlite3` / `*.sqlite3` 两条**匹配不到** `db.sqlite3-wal` / `db.sqlite3-shm`，故需单列。
+*.sqlite3-wal
+*.sqlite3-shm
+
+# 测试/验证脚本产生的临时目录（如 x18/x19 套件、前端打包验证）
+.tmp/
 
 # ===== Django 运行时目录（保留空目录，忽略生成内容）=====
-backend/uploads/
+# 注意：必须写成 `X/*` 而不是 `X/` —— 父目录被整体排除后，`!X/.gitkeep` 无法再把其中的文件纳入。
+backend/uploads/*
 !backend/uploads/.gitkeep
-backend/logs/
+backend/logs/*
 !backend/logs/.gitkeep
 backend/staticfiles/
+# 快照归档目录（apps.snapshots）：含整库数据与上传文件，绝不入库；
+# 升级脚本（deploy-linux.sh / update-from-github.sh）已显式 --exclude snapshots 保留它
+backend/snapshots/
+# 快照单测使用的临时归档目录
+backend/snapshots_test_tmp/
+# 本地验证用的数据库备份
+backend/db.sqlite3.bak*
 
 # ===== 密钥 / 环境配置 =====
 .env
@@ -43,9 +58,13 @@ tests/fix_verify/watcher/.tmp/
 tests/fix_verify/scripts/.tmp/
 
 # ===== 日志（保留项目根 logs/ 空目录）=====
-logs/
+logs/*
 !logs/.gitkeep
 *.log
+
+# ===== 开发期上传目录（保留空目录）=====
+uploads/*
+!uploads/.gitkeep
 
 # ===== OS / 编辑器 =====
 .DS_Store
@@ -78,3 +97,17 @@ contract_watcher/config.json
 contract_watcher/config.json.tmp
 contract_watcher/**/*.xlsx.bak*
 contract_watcher/bookkeeping_example/no-such.xlsx
+
+# ===== 中间过程产物（2026-09 基线整理：结论性文档已归档，产物不再入库）=====
+# 审计/探针取证工作目录：只放临时产物（before/after 代码快照、patch/harness、运行输出）。
+# 结论性报告已归档至 docs/audit/ —— 见 docs/audit/README.md 的「归档说明」。
+code_audit/
+# 独立验收套件的原始运行日志（可用 tests/ops_check/run_all.cmd 原样重跑再生）
+tests/ops_check/_artifacts/
+# 分支差异的机器生成 diff（数百 KB ~ 数 MB，可用 docs/branch-diff/gen-report.ps1 重跑再生）
+docs/branch-diff/*.diff
+# 前端验证用例的 esbuild 打包产物
+tests/fix_verify/frontend/.build/
+# 临时链接检查/整理输出
+.linkcheck-out.txt
+.linkfix-out.txt

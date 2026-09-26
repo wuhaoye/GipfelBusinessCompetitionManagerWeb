@@ -9,9 +9,13 @@
  * （esbuild 构建产物）：改前 2 个用例失败，改后全部通过。改前状态下的
  * nextRequest / isCurrent 桩不会被旧代码引用，因此同一套断言可以直接跑改前代码。
  *
- * 用法：
- *   frontend/node_modules/@esbuild/win32-x64/esbuild.exe frontend/src/composables/useLatestRequest.ts --format=esm --outfile=<临时目录>/useLatestRequest.mjs
+ * 用法（该模块 `import { ref } from "vue"`，**必须 --bundle --platform=browser**，
+ * 否则 Node 侧 import 会 ERR_MODULE_NOT_FOUND: Cannot find package 'vue'）：
+ *   frontend/node_modules/@esbuild/win32-x64/esbuild.exe frontend/src/composables/useLatestRequest.ts --format=esm --bundle --platform=browser --outfile=<临时目录>/useLatestRequest.mjs
  *   node tests/fix_verify/frontend/test_w08_warehouses_race.mjs <临时目录>/useLatestRequest.mjs
+ * 也可直接用仓库入口一键打包（推荐）：
+ *   powershell -NoProfile -ExecutionPolicy Bypass -File tests/fix_verify/frontend/bundle.ps1 -Entry tests/fix_verify/frontend/entries/use_latest_request_entry.mjs -Outfile tests/fix_verify/frontend/.build/useLatestRequest.mjs
+ *   node tests/fix_verify/frontend/test_w08_warehouses_race.mjs tests/fix_verify/frontend/.build/useLatestRequest.mjs
  */
 import assert from "node:assert/strict";
 import fs from "node:fs";

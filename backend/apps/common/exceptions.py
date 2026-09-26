@@ -39,19 +39,29 @@ class BusinessError(APIException):
 def exception_handler(exc, context):
     """DRF 异常处理器：统一脱敏 + 包装为 {code,message,data:null}。"""
     response = drf_exception_handler(exc, context)
+    request = context.get("request")
 
-    # 写审计日志（异常上下文），脱敏由 audit 模块负责
+    # 写审计日志（异常上下文），脱敏由 audit 模块负责。
+    # C2 阶段 1 降噪：分流判据全在 log_exception 内部（settings.AUDIT_HTTP_ERROR_MODE）：
+    #   all=全部落库（改造前）/ sampled=5xx 全量 + 4xx 采样 / off=只写日志；
+    # 三种模式下 log_exception 都**始终**写 logger（method/path/status/operator）。
+    # 业务写审计 log_write 不经过本路径，永不受降噪影响。
     try:
         from .audit import log_exception
 
-        request = context.get("request")
         log_exception(request, exc, response)
     except Exception:  # noqa: BLE001 - 审计失败不影响主流程
         logger.debug("异常审计写入失败", exc_info=True)
 
     if response is None:
-        # 未被 DRF 接住的异常（500）
-        logger.error("未处理异常", exc_info=exc)
+        # 未被 DRF 接住的异常（500）：log_exception 已按 500 全量落库，
+        # 这里补一条带 method/path 的文件日志（原先只有堆栈，定位不到入口）。
+        logger.error(
+            "未处理异常 %s %s",
+            getattr(request, "method", None) or "-",
+            getattr(request, "path", None) or "-",
+            exc_info=exc,
+        )
         return _wrap(status.HTTP_500_INTERNAL_SERVER_ERROR, "服务器内部错误，请稍后重试")
 
     # DRF 标准异常

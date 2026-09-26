@@ -2,6 +2,7 @@ import { io, type Socket } from "socket.io-client";
 import { getApiBaseUrl, versionBlocked } from "@/config";
 import { getAccountItem } from "@/utils/accountStorage";
 import { logger } from "@/utils/logger";
+import { applyGateState, markRestored, type GateState } from "@/system/gate";
 
 let socket: Socket | null = null;
 // 记录当前 socket 连接所用的 baseUrl；serverUrl 变更后用于检测并重建单例。
@@ -49,7 +50,17 @@ export function connectRealtime(): Socket | null {
     transports: ["websocket"],
     reconnection: true,
     reconnectionAttempts: Infinity,
+    // ---------- 重连退避 + 抖动（C3.3）----------
+    // socket.io 内建指数退避：第 n 次重连等待 =
+    //   min(reconnectionDelay × 2^n, reconnectionDelayMax) × random(1 ± randomizationFactor)。
+    // 三个参数**显式写出**（取值与 socket.io-client 默认一致），一是避免库默认值漂移后
+    // 全场客户端在同一毫秒重连，二是让「退避 + 抖动」在本仓库可被核对
+    // （见 tests/fix_verify/frontend/test_c3_heartbeat_backoff.mjs 的静态断言）。
+    // 注：真正会把后端打满的扇出发生在「重连成功后的对账请求」，其并发上限（2）与
+    // 启动抖动 + 指数退避重试在 api/request.ts::reconcileAllIncremental 中实现。
     reconnectionDelay: 2000,
+    reconnectionDelayMax: 5000,
+    randomizationFactor: 0.5,
   });
   // ---------- 连接错误处理：检测认证失败（被顶号）并立即触发登出 ----------
   // 当设备 B 登录顶掉设备 A 后，设备 A 的 socket 断连后会尝试用旧 token 重连。
@@ -76,6 +87,38 @@ export function connectRealtime(): Socket | null {
     if (payload && payload.reason === "token_version_mismatch") {
       window.dispatchEvent(new CustomEvent("auth:kicked"));
     }
+  });
+  // ---------- 系统门禁事件：强制暂停 / 回退中 / 已恢复 / 回退完成 ----------
+  // 与 auth:required 同理，必须在 socket 创建时立即注册 —— 否则在 store 初始化前
+  // 到达的「强制暂停」会丢失，用户会在暂停期间继续操作。
+  // 这里只写入叶子状态（请求拦截器据此冻结写请求）并派发 window 事件，
+  // 由 stores/gate.ts 负责后续的缓存清理与整体重载。
+  const dispatchGate = (kind: string, payload?: unknown) => {
+    window.dispatchEvent(new CustomEvent("system-gate", { detail: { kind, payload } }));
+  };
+  socket.on("system:state", (payload: GateState) => {
+    applyGateState(payload);
+    dispatchGate("state", payload);
+  });
+  socket.on("system:paused", (payload: GateState) => {
+    applyGateState(payload);
+    dispatchGate("paused", payload);
+    logger.warn("[Realtime] 系统已强制暂停：", payload?.reason || "");
+  });
+  socket.on("system:restoring", (payload: GateState) => {
+    applyGateState(payload);
+    dispatchGate("restoring", payload);
+  });
+  socket.on("system:progress", (payload: GateState) => {
+    applyGateState(payload);
+  });
+  socket.on("system:resumed", (payload: GateState) => {
+    applyGateState(payload);
+    dispatchGate("resumed", payload);
+  });
+  socket.on("system:restored", (payload: Record<string, unknown>) => {
+    markRestored(payload as never);
+    dispatchGate("restored", payload);
   });
   // 断线自动重连成功（仅 reconnection，不含首次 connect）：通知业务层重订阅房间 + 回源刷新。
   // 注意：遗漏事件的补发统一由 resource-changed.ts 在 "connect" 事件（含重连后的 connect）中发起，

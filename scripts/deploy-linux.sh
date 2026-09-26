@@ -9,11 +9,15 @@
 # 步骤：
 #   1. 系统依赖（python3-venv python3-dev nodejs npm nginx rsync）
 #   2. 同步代码到 $INSTALL_DIR，备份已有数据
-#   3. 虚拟环境 + pip
+#   3. 虚拟环境 + pip（含 C1-a 的 gunicorn / redis）
 #   4. migrate（自动 seed 默认 admin）
 #   5. npm ci + build → frontend-dist
-#   6. systemd unit gipfel.service enable --now
-#   7. [可选] nginx vhost 写入 + reload
+#   6. systemd unit（C1-a 起是**三个**）：
+#        gipfel.service        daphne(ASGI)  :8000  → /socket.io/（实时总线 hub）
+#        gipfel-wsgi.service   gunicorn(WSGI):8002  → /api/、/admin/（多 worker 多线程）
+#        gipfel-logviewer.service 日志查看器 :8121
+#   7. [可选] nginx vhost 写入 + reload（upstream gipfel_django→8002、gipfel_socketio→8000，
+#      并含 C3 的 limit_req/limit_conn 与 $request_time 日志格式）
 # ============================================================
 set -euo pipefail
 # 强制标准输入来自 /dev/null：任何隐式 read/openssl 等待熵等都不会卡在终端等待输入。
@@ -72,9 +76,27 @@ MIGRATE_STARTED=0
 MIGRATE_OK=0
 PRE_MIGRATE_DB_SNAPSHOT=""
 CODE_HEAD_BEFORE=""
+# C2 阶段 1（WAL）后：migrate 前**必须**先停掉所有持有该库的进程，否则会出现
+# 「同一库被 rollback-journal 与 WAL 两种日志模式并发访问」→ 真机实测直接
+# `database disk image is malformed`（docs/真机验证报告-Debian13.md §3.5）。
+SERVICES_STOPPED=0
+SERVICES_TO_MANAGE="gipfel gipfel-wsgi gipfel-logviewer"
 
 _on_exit() {
     local rc=$?
+    # 失败且我们已经停过服务 → 尽力把服务拉回运行态，避免"部署失败 + 站点长时间 502"的复合故障
+    if [[ "$rc" != "0" && "$SERVICES_STOPPED" == "1" ]]; then
+        warn "脚本失败，但服务在 migrate 前已被停止 —— 正在尽力恢复服务运行（避免站点长时间不可用）"
+        for _svc in $SERVICES_TO_MANAGE; do
+            [[ -f "/etc/systemd/system/${_svc}.service" ]] || continue
+            systemctl start "$_svc" 2>/dev/null || true
+        done
+        sleep 2
+        for _svc in $SERVICES_TO_MANAGE; do
+            [[ -f "/etc/systemd/system/${_svc}.service" ]] || continue
+            printf '      %s = %s\n' "$_svc" "$(systemctl is-active "$_svc" 2>&1)"
+        done
+    fi
     if [[ "$rc" != "0" && "$MIGRATE_STARTED" == "1" && "$MIGRATE_OK" != "1" ]]; then
         echo
         warn "脚本以退出码 $rc 结束，且已执行过 migrate（或正在执行）—— 数据库结构可能已改变。"
@@ -256,6 +278,7 @@ check_exists "$PROJECT_ROOT/backend/requirements.txt"
 check_exists "$PROJECT_ROOT/backend/.env.example"
 check_exists "$PROJECT_ROOT/frontend/package.json"
 check_exists "$PROJECT_ROOT/deploy/gipfel.service"
+check_exists "$PROJECT_ROOT/deploy/gipfel-wsgi.service"
 check_exists "$PROJECT_ROOT/deploy/logviewer.service"
 check_exists "$PROJECT_ROOT/deploy/nginx-gipfel.conf"
 
@@ -337,9 +360,21 @@ log "同步代码 → $INSTALL_DIR"
 mkdir -p "$INSTALL_DIR"
 # 仅同步 backend / frontend / deploy 三个源码目录；避免 node_modules / .venv / db.sqlite3
 # （--delete 只删目标端已同步子目录内的旧文件）
+#
+# ★ `--exclude=/snapshots/` 的**前导斜杠不可省**：rsync 的排除模式若不带 `/` 是「任意层级同名目录」，
+#   而 `backend/apps/snapshots/` 是 **Django app**（在 INSTALLED_APPS 里）—— 写成 `--exclude snapshots`
+#   会连同这个 app 一起排除，再叠加 `--delete` 就会把线上该 app **删掉**，服务启动直接
+#   `ModuleNotFoundError: No module named 'apps.snapshots'`。带前导斜杠后只匹配
+#   **传输根**下的 `snapshots/`（即历史快照归档目录），app 目录不受影响。
+#   （真机复现记录见 docs/真机验证报告-Debian13.md §3.4）
+# ★ `db.sqlite3*` 必须带通配符：C2 阶段 1 之后源目录里的 `db.sqlite3` 常处于 WAL 模式，
+#   旁边会有 `db.sqlite3-wal` / `db.sqlite3-shm`。只排除 `db.sqlite3` 会把**源库的 WAL**
+#   拷到线上主库旁边 —— SQLite 会拿一个「属于另一个数据库的 WAL」去恢复线上库，直接得到
+#   `database disk image is malformed`，且此后备份/迁移全部失败（真机事故：
+#   docs/真机验证报告-Debian13.md §3.6）。
 rsync -a --delete --exclude .venv --exclude __pycache__ --exclude '*.pyc' \
-    --exclude node_modules --exclude dist --exclude db.sqlite3 \
-    --exclude uploads --exclude logs --exclude '.env' \
+    --exclude node_modules --exclude dist --exclude 'db.sqlite3*' \
+    --exclude uploads --exclude logs --exclude '.env' --exclude=/snapshots/ \
     "$PROJECT_ROOT/backend/"  "$INSTALL_DIR/backend/"
 rsync -a --delete --exclude node_modules --exclude dist \
     "$PROJECT_ROOT/frontend/" "$INSTALL_DIR/frontend/"
@@ -354,9 +389,15 @@ if [[ -f "$BACKUP_DIR/.env" && ! -f "$INSTALL_DIR/backend/.env" ]]; then
     cp -a "$BACKUP_DIR/.env" "$INSTALL_DIR/backend/.env"
 fi
 # 恢复备份的数据库（核心业务数据，必须随部署保留，否则重部署会丢失全部数据）
+# ★ WAL 安全性说明（C2 阶段 1 起 SQLite 为 WAL 模式）：
+#   本分支只在**目标库不存在**（`! -f`）时执行 —— 即"新建/库被删"的独占场景，
+#   此时 install 目录下不存在 db.sqlite3-wal/-shm（没有库就没有 WAL），
+#   而 $BACKUP_DIR/db.sqlite3 是 snapshot_sqlite_consistent（VACUUM INTO）产出的自洽副本，
+#   因此这里的 cp 是 WAL 安全的。**不要**把它改成"库存在时也覆盖"——
+#   那时必须 ① 先停服 ② 先 rm -f db.sqlite3-wal/-shm，否则旧 WAL 会被重放到恢复出来的库上。
 if [[ -f "$BACKUP_DIR/db.sqlite3" && ! -f "$INSTALL_DIR/backend/db.sqlite3" ]]; then
     cp -a "$BACKUP_DIR/db.sqlite3" "$INSTALL_DIR/backend/db.sqlite3"
-    log "已从备份恢复数据库 $BACKUP_DIR/db.sqlite3"
+    log "已从备份恢复数据库 $BACKUP_DIR/db.sqlite3（目标库原本不存在＝无 WAL 残留，属安全场景）"
 fi
 
 # 首次部署无 .env → 从 example 复制，生成随机 JWT_SECRET
@@ -466,6 +507,15 @@ fi
 # 可用点，必须在 vhost 渲染与 ufw 放行之前完成。
 LV_PORT="$(_log_viewer_port "$INSTALL_DIR/backend/.env")"
 log "日志查看器公网监听端口：${LV_PORT}（daphne 内部仍绑 8121，两者解耦避免同机抢端口）"
+
+# C1-a：gunicorn(WSGI) 的本地端口（默认 8002；.env 的 GIPFEL_WSGI_PORT 可覆盖）。
+# 与 deploy/gipfel-wsgi.service 的 Environment="GIPFEL_WSGI_PORT=8002" 同一默认值：
+#   · 健康检查（WSGI :8002/api/health）用它；
+#   · vhost 渲染后校验/同步 upstream gipfel_django 的端口用它
+#     （模板里写死 127.0.0.1:8002 是为了让默认拓扑一眼可见；.env 改了端口时脚本会把
+#      渲染产物里的 upstream 一起改掉，避免"unit 换了端口、nginx 还指着旧端口 → 502"）。
+_WSGI_PORT="$(gipfel_wsgi_port "$INSTALL_DIR/backend/.env")"
+log "WSGI(gunicorn) 本地监听端口：${_WSGI_PORT}（nginx upstream gipfel_django 指向它；仅绑回环，不对公网暴露）"
 
 # 自愈：无域名部署且 .env 已存在时，纠正/补全 LOG_VIEWER_PUBLIC_URL。
 #   - 显式 --public-ip：无论当前有无/对错，都以它为准写入（覆盖内网 IP 或缺失该行）
@@ -604,7 +654,7 @@ if [[ -f "$INSTALL_DIR/backend/.env" ]]; then
     fi
 fi
 
-mkdir -p "$INSTALL_DIR/backend/uploads" "$INSTALL_DIR/backend/logs"
+mkdir -p "$INSTALL_DIR/backend/uploads" "$INSTALL_DIR/backend/logs" "$INSTALL_DIR/backend/snapshots"
 ok "代码同步完成"
 
 # ---------------- 3. 虚拟环境 + pip ----------------
@@ -618,6 +668,33 @@ else
 fi
 ".venv/bin/pip" install -r requirements.txt
 ok "Python 依赖安装完成"
+
+# ---------------- 3.5 停服务：migrate 前必须先停（C2 阶段 1 起为硬要求） ----------------
+# 为什么必须：C2 阶段 1 把 SQLite 切到 WAL。`migrate` 会把库从 rollback journal 切到 WAL，
+# 而**旧版本的服务进程仍在运行**（它用 rollback journal 持有连接）——同一库被两种日志模式
+# 并发访问，真机实测直接得到 `database disk image is malformed`（首次部署即复现，
+# 见 docs/真机验证报告-Debian13.md §3.5）；此时脚本的一致性快照备份、迁移与线上库全部不可用。
+# 停服后 migrate 才能安全切换并独占写权。失败的 EXIT trap 会尽力把服务拉回运行态。
+log "停止后端服务（migrate 前必须停止：WAL 切换要求没有其它连接持有该库）"
+for _svc in $SERVICES_TO_MANAGE; do
+    if [[ -f "/etc/systemd/system/${_svc}.service" ]]; then
+        if systemctl is-active --quiet "$_svc" 2>/dev/null; then
+            if systemctl stop "$_svc" 2>/dev/null; then
+                ok "已停止 $_svc"
+                SERVICES_STOPPED=1
+            else
+                warn "停止 $_svc 失败（继续；若 migrate 报锁错误请手动停服后重跑）"
+            fi
+        fi
+    fi
+done
+if [[ "$SERVICES_STOPPED" == "1" ]]; then
+    sleep 1
+    for _svc in $SERVICES_TO_MANAGE; do
+        [[ -f "/etc/systemd/system/${_svc}.service" ]] || continue
+        systemctl is-active --quiet "$_svc" 2>/dev/null && warn "$_svc 仍在运行（migrate 可能失败）"
+    done
+fi
 
 # ---------------- 4. 数据库迁移 + seed 默认 admin ----------------
 log "执行 migrate（首次会自动建 admin，密码自动生成或取自 .env SEED_ADMIN_PASSWORD）"
@@ -661,12 +738,16 @@ chmod 600 "$INSTALL_DIR/backend/.env" 2>/dev/null || true
 ok "文件归属已切换为 gipfel（运行时可写 db/uploads/logs），.env 权限收紧为 600"
 
 # ---------------- 6. systemd unit ----------------
-log "写入 systemd 服务 gipfel.service / gipfel-logviewer.service"
+# C1-a：现在是**三个** unit ——
+#   gipfel.service        daphne(ASGI)  127.0.0.1:8000  → 只承载 /socket.io/（+ 回环兼容的完整 Django）
+#   gipfel-wsgi.service   gunicorn(WSGI) 127.0.0.1:8002 → 承载 /api/、/admin/（多 worker 多线程）
+#   gipfel-logviewer.service 日志查看器 daphne 127.0.0.1:8121
+log "写入 systemd 服务 gipfel.service / gipfel-wsgi.service / gipfel-logviewer.service"
 # masked 自愈：mask 有两种落点——永久（/etc/systemd/system/<unit> → /dev/null）与
 # 运行时（/run/systemd/system/<unit> → /dev/null，且 /run 优先级高于 /etc，会遮蔽 /etc 的真实 unit）。
 # cp -f 会跟随 /dev/null 软链把内容写进 /dev/null 而非替换软链，故必须先无条件 unmask
 # （systemctl unmask 同时清理两处）并删除两处软链，再写入真实 unit。
-for _svc in gipfel.service gipfel-logviewer.service; do
+for _svc in gipfel.service gipfel-wsgi.service gipfel-logviewer.service; do
     if [[ -L "/etc/systemd/system/$_svc" || -L "/run/systemd/system/$_svc" ]]; then
         warn "检测到 $_svc 存在 mask 软链，执行 unmask 解除"
     fi
@@ -680,6 +761,15 @@ _tmp_unit="$(mktemp /tmp/gipfel.unit.XXXXXX)"
 sed -e "s|__INSTALL_DIR__|$INSTALL_DIR|g" "$PROJECT_ROOT/deploy/gipfel.service" > "$_tmp_unit"
 rm -f /etc/systemd/system/gipfel.service
 cp -f "$_tmp_unit" /etc/systemd/system/gipfel.service
+rm -f "$_tmp_unit"
+
+# C1-a：gunicorn(WSGI) unit —— 与上面同款渲染（只替换 __INSTALL_DIR__；
+# 端口/worker/线程默认值在 unit 的 Environment= 里，可被 backend/.env 的
+# GIPFEL_WSGI_PORT/WORKERS/THREADS/TIMEOUT 覆盖，脚本与模板都不写死）
+_tmp_unit="$(mktemp /tmp/gipfel.unit.XXXXXX)"
+sed -e "s|__INSTALL_DIR__|$INSTALL_DIR|g" "$PROJECT_ROOT/deploy/gipfel-wsgi.service" > "$_tmp_unit"
+rm -f /etc/systemd/system/gipfel-wsgi.service
+cp -f "$_tmp_unit" /etc/systemd/system/gipfel-wsgi.service
 rm -f "$_tmp_unit"
 
 LV_UNIT_FILE="$INSTALL_DIR/deploy/logviewer.service"
@@ -702,9 +792,23 @@ if ! systemctl is-active --quiet gipfel; then
     warn "gipfel 服务未立即激活，等待 5s 重试检查"
     sleep 5
 fi
-systemctl is-active --quiet gipfel && ok "gipfel.service 运行中" || \
+systemctl is-active --quiet gipfel && ok "gipfel.service 运行中（daphne :8000，/socket.io/）" || \
     { systemctl show -p LoadState,FragmentPath gipfel | while IFS= read -r l; do warn "  $l"; done; \
       journalctl -u gipfel -n 30 --no-pager; err "gipfel 服务启动失败，见上方日志"; }
+
+# C1-a：gunicorn(WSGI) —— 与 daphne 同样必须 restart（enable --now 对已运行 unit 是空操作）。
+# 启动顺序上 daphne 先起（它是实时总线的 hub），WSGI 的 forward 即使失败也只丢事件不阻断业务，
+# 故这里不做"daphne 必须先就绪"的强校验。
+systemctl enable gipfel-wsgi 2>/dev/null || warn "systemctl enable gipfel-wsgi 失败（unit 可能仍被 masked），详见下方活性检查"
+systemctl restart gipfel-wsgi 2>/dev/null || warn "systemctl restart gipfel-wsgi 失败，详见下方活性检查"
+sleep 2
+if ! systemctl is-active --quiet gipfel-wsgi; then
+    warn "gipfel-wsgi 服务未立即激活，等待 5s 重试检查"
+    sleep 5
+fi
+systemctl is-active --quiet gipfel-wsgi && ok "gipfel-wsgi.service 运行中（gunicorn :${_WSGI_PORT}，/api/）" || \
+    { systemctl show -p LoadState,FragmentPath gipfel-wsgi | while IFS= read -r l; do warn "  $l"; done; \
+      journalctl -u gipfel-wsgi -n 30 --no-pager; err "gipfel-wsgi 服务启动失败，见上方日志（常见原因：gunicorn 未安装 / 端口被占用 / GIPFEL_WSGI_PORT 非法）"; }
 
 # 日志查看器（独立站点，nginx 子域 log.<DOMAIN> 代理）
 # 同 X-31：enable --now 对已运行 unit 是空操作，必须 restart 才会加载新代码
@@ -739,6 +843,24 @@ if [[ $WITH_NGINX -eq 1 ]]; then
         sed -i "s|__LOG_VIEWER_PORT__|${LV_PORT}|g" "$_tmp_vhost"
         warn "请将 scripts/deploy-linux.sh 与 deploy/nginx-gipfel.conf 同步升级到同一 commit 后再跑"
     fi
+
+    # C1-a：把 upstream gipfel_django 的端口对齐到 .env 的 GIPFEL_WSGI_PORT。
+    #   模板里写死 `server 127.0.0.1:8002`（默认拓扑一眼可见、便于回归断言）；
+    #   但 unit 侧端口可被 .env 覆盖，若只改 .env 而不动模板，nginx 会一直把 /api/ 打到
+    #   没人监听的 8002 → 全站 502，且 nginx -t 通过、毫无线索。这里做渲染期同步。
+    if [[ "$_WSGI_PORT" != "8002" ]]; then
+        warn "检测到 .env 的 GIPFEL_WSGI_PORT=${_WSGI_PORT} ≠ 模板默认 8002 → 同步改写渲染产物里的 upstream gipfel_django"
+        sed -i "s|127.0.0.1:8002|127.0.0.1:${_WSGI_PORT}|g" "$_tmp_vhost"
+        # 必须改到且只改到一处（top-level upstream 里那一行；注释里的说明文字同步改掉也无害）
+        if ! grep -q "server 127.0.0.1:${_WSGI_PORT} fail_timeout" "$_tmp_vhost"; then
+            err "改写 upstream 端口失败：渲染产物里找不到 'server 127.0.0.1:${_WSGI_PORT} fail_timeout'（模板 upstream gipfel_django 可能被改动）"
+        fi
+    fi
+    # 自检：upstream gipfel_django 必须指向 WSGI 端口，upstream gipfel_socketio 必须指向 daphne:8000
+    grep -qE "server 127\.0\.0\.1:${_WSGI_PORT} fail_timeout" "$_tmp_vhost" \
+        || err "渲染产物里 upstream gipfel_django 未指向 WSGI 端口 ${_WSGI_PORT}，请检查 deploy/nginx-gipfel.conf"
+    grep -qE 'server 127\.0\.0\.1:8000 fail_timeout' "$_tmp_vhost" \
+        || err "渲染产物里 upstream gipfel_socketio 未指向 daphne 127.0.0.1:8000，请检查 deploy/nginx-gipfel.conf"
     VHOST_FILE="$_tmp_vhost"
 
     # 日志查看器 server 块二选一（模板含两块，按是否传 --domain 删除另一块）：
@@ -939,6 +1061,12 @@ ${_bad_prose}
             "")    problem "后端 /api/health 探针无响应（nginx 或 gipfel 未起来）" ;;
             *)     problem "后端 /api/health 探针返回 HTTP ${_api_code}（期望 2xx/3xx）" ;;
         esac
+        # C1-a：再**直连两个后端端口**分别探活。经 nginx 的 /api/health 只能证明"某个后端活着"；
+        # 分离部署最常见的故障就是只起了一个 unit（/api/ 正常但实时全掉，或反之），
+        # 必须按端口分别确认：WSGI(gunicorn) :8002/api/health 与 daphne :8000/socket.io/ 握手。
+        if ! split_backend_health "$_WSGI_PORT" "${GIPFEL_DAPHNE_PORT:-8000}"; then
+            problem "WSGI/daphne 分层健康检查未全部通过（见上方 WARN 行）：两个进程都必须在跑（/api/ 走 WSGI，/socket.io/ 走 daphne）"
+        fi
     else
         warn "未安装 curl，跳过部署后的功能探针"
     fi
@@ -1069,7 +1197,8 @@ else
 fi
 
 echo "  目录：        $INSTALL_DIR"
-echo "  后端状态：    systemctl status gipfel"
+echo "  后端状态：    systemctl status gipfel        # daphne :8000（/socket.io/，实时总线 hub）"
+echo "                systemctl status gipfel-wsgi   # gunicorn :${_WSGI_PORT}（/api/、/admin/，WSGI）"
 if [[ $WITH_NGINX -eq 1 ]]; then
     SERVER_IP="$(hostname -I | awk '{print $1}' || true)"
     if [[ -n "$DOMAIN" ]]; then
@@ -1088,7 +1217,7 @@ if [[ $WITH_NGINX -eq 1 ]]; then
     fi
     echo "  Nginx 状态：  systemctl status nginx"
 fi
-echo "  日志：        journalctl -u gipfel -f   /   tail -F $INSTALL_DIR/backend/logs/app.log"
+echo "  日志：        journalctl -u gipfel -f   /   journalctl -u gipfel-wsgi -f   /   tail -F $INSTALL_DIR/backend/logs/app.log"
 
 # ============================================================
 # 部署自检：把「线上实际生效的状态」直接打出来。
@@ -1123,15 +1252,53 @@ if command -v systemctl >/dev/null 2>&1; then
     fi
 fi
 
-# 2) 监听端口：80/443 必有；8443 视形态；8121 是日志查看器内部端口
+# 1b) C1-a：两个后端进程**实际读到**的实时总线角色 —— 用来确认 unit 里的 Environment=
+#     真的生效（或 .env 有意覆盖成了 redis）。角色配错的后果是"实时广播静默失效"（无报错）。
+if command -v systemctl >/dev/null 2>&1; then
+    for _svc in gipfel gipfel-wsgi; do
+        _bus_pid="$(systemctl show -p MainPID "$_svc" 2>/dev/null | cut -d= -f2)"
+        if [[ -n "$_bus_pid" && "$_bus_pid" != "0" && -r "/proc/$_bus_pid/environ" ]]; then
+            _bus="$(tr '\0' '\n' < "/proc/$_bus_pid/environ" 2>/dev/null | grep -E '^REALTIME_BUS=' | tail -1 | cut -d= -f2- || true)"
+            echo "  [OK]   ${_svc} 生效的 REALTIME_BUS=${_bus:-（未设置 → 应用按 auto 判定）}"
+            case "${_svc}:${_bus}" in
+                gipfel:hub|gipfel-wsgi:forward|gipfel:redis|gipfel-wsgi:redis) : ;;
+                *) echo "  [WARN] ${_svc} 的 REALTIME_BUS 期望 hub（daphne）/ forward（WSGI），或两端一致的 redis；实际 '${_bus}'"
+                   echo "         修：检查 /etc/systemd/system/${_svc}.service 的 Environment= 与 backend/.env 是否互相覆盖；改完 systemctl daemon-reload && systemctl restart gipfel gipfel-wsgi"
+                   _SELFCHECK_WARN=1 ;;
+            esac
+        else
+            echo "  [WARN] 读不到 ${_svc} 进程环境（未运行或无权读取）→ systemctl status ${_svc}"
+            _SELFCHECK_WARN=1
+        fi
+    done
+fi
+
+# 2) 监听端口：80/443 必有；8443 视形态；8121 是日志查看器内部端口；
+#    C1-a 之后还必须看到 **127.0.0.1:8000（daphne）与 127.0.0.1:<WSGI_PORT>（gunicorn）** ——
+#    这两个才是分离拓扑的本体，缺任一即说明对应 unit 没起来。
 if command -v ss >/dev/null 2>&1; then
     echo "  监听端口："
-    ss -lntp 2>/dev/null | grep -E ':(80|443|8121|8443)\b' | sed 's/^/    /' || echo "    （未匹配到 80/443/8121/8443）"
+    ss -lntp 2>/dev/null | grep -E ":(80|443|8000|${_WSGI_PORT}|8121|8443)\b" | sed 's/^/    /' || echo "    （未匹配到 80/443/8000/${_WSGI_PORT}/8121/8443）"
+    if ! ss -lnt 2>/dev/null | grep -qE ":${_WSGI_PORT}\b"; then
+        echo "  [WARN] WSGI 端口 ${_WSGI_PORT} 没有在监听 → gunicorn 没起来：systemctl status gipfel-wsgi"
+        _SELFCHECK_WARN=1
+    fi
+    if ! ss -lnt 2>/dev/null | grep -qE ':8000\b'; then
+        echo "  [WARN] daphne 端口 8000 没有在监听 → /socket.io/ 会 502：systemctl status gipfel"
+        _SELFCHECK_WARN=1
+    fi
     if [[ -n "$LOGVIEWER_TLS_PORT" ]] && ! ss -lnt 2>/dev/null | grep -qE ":${LOGVIEWER_TLS_PORT}\b"; then
         echo "  [WARN] 已要求日志查看器监听 ${LOGVIEWER_TLS_PORT}，但它没有在监听"
         echo "         → 多半是 nginx 未 reload 或缺少该 server 块：sudo nginx -t && sudo systemctl reload nginx"
         _SELFCHECK_WARN=1
     fi
+fi
+
+# 2b) C1-a：直连两个后端端口分别探活（唯一实现见 scripts/lib/deploy-common.sh）。
+#     不要只依赖经 nginx 的 /api/health：它区分不出"两个进程都活着"与"只起了一个"。
+if ! split_backend_health "$_WSGI_PORT" "${GIPFEL_DAPHNE_PORT:-8000}"; then
+    echo "  [WARN] 上方 WSGI/daphne 分层健康检查有失败项：/api/ 走 WSGI、/socket.io/ 走 daphne，两个都必须 active"
+    _SELFCHECK_WARN=1
 fi
 
 # 3) 日志查看器自身健康（绕开 nginx，直连内部端口）

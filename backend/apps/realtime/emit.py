@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """实时广播辅助。
 
 【关键集成点】python-socketio AsyncServer(async_mode="asgi") 的 emit 必须在 ASGI
@@ -10,6 +11,14 @@
 3. 结果用 Future 等待，但有 1s 超时；超时不阻断 HTTP 主流程
 4. loop 未就绪时（如脚本/migrate/测试）降级为静默跳过
 
+【C1-a 改造】「投递出口」换成跨进程总线 `apps.realtime.bus`（HTTP 与 WebSocket
+进程分离后，WSGI 进程里的 emit 推不到 daphne 进程里的 socket）：
+- **本模块公开函数签名与语义一律不变**（调用方：apps/common/signals.py、
+  apps/snapshots/*、各视图，均未改动）；
+- seq 分配 / 环形缓冲 / 实际投递分别委托 `bus.allocate_seq` / `bus.push_ring` /
+  `bus.deliver`，按 settings.REALTIME_BUS = auto/local/hub/forward/redis 分派；
+- `_after_commit` 延迟提交语义不变（见下），因此 seq 仍在提交后才分配。
+
 契约对齐前端 realtime/resource-changed.ts 的 ResourceChangedEvent：
     { resource, ids[], action ("created"|"updated"|"deleted"|"bulk"),
       competitionId, seq, ts }
@@ -20,8 +29,8 @@ import asyncio
 import logging
 import threading
 import time
-from collections import deque
-from itertools import islice
+
+from . import bus
 
 logger = logging.getLogger("gipfel")
 
@@ -30,16 +39,20 @@ EVENT_PERMISSIONS_CHANGED = "permissions:changed"
 #: 通知客户端「需要重新认证」（顶号 / 被禁用 / 密码被重置后由前端清登录态并跳登录页）
 EVENT_AUTH_REQUIRED = "auth:required"
 
-# 序列计数器
-_seq_lock = threading.Lock()
-_seq_value: int = 0
-
-# 重放环形缓冲
-_RING_MAX_LEN = 5000
-_ring_lock = threading.Lock()
-_event_ring: deque = deque(maxlen=_RING_MAX_LEN)
-# 与 _event_ring 同步的 seq 序列（单调增），用于 replay_since 二分定位（避免 O(N) 线性扫描）
-_ring_seqs: deque = deque(maxlen=_RING_MAX_LEN)
+# ---------- 系统门禁（快照 / 强制暂停 / 回退）事件 ----------
+#: 全量状态快照（连接握手、状态变更时下发）：{mode, reason, message, since, expiresAt,
+#: dataVersion, activeSnapshotId, progress, operatorName, seq, ts}
+EVENT_SYSTEM_STATE = "system:state"
+#: 强制暂停（写请求全部被冻结）
+EVENT_SYSTEM_PAUSED = "system:paused"
+#: 回退进行中（读写全部被冻结）
+EVENT_SYSTEM_RESTORING = "system:restoring"
+#: 恢复运行（客户端应比对 dataVersion 决定是否整体重载）
+EVENT_SYSTEM_RESUMED = "system:resumed"
+#: 回退完成后的一次性通知：{snapshotId, label, dataVersion, rows, tables, ...}
+EVENT_SYSTEM_RESTORED = "system:restored"
+#: 操作进度（快照创建 / 回退阶段）
+EVENT_SYSTEM_PROGRESS = "system:progress"
 
 # ASGI 事件循环引用（由 gateway.connect 首次触发时赋值；仅写一次）
 _loop_lock = threading.Lock()
@@ -62,55 +75,49 @@ def _get_loop_safe() -> asyncio.AbstractEventLoop | None:
         return _loop
 
 
-# --------------------------------------------------------------------
+# ====================================================================
+# 序号 / 环形缓冲（委托跨进程总线 bus：local/hub=进程内，redis=INCR+ZSET）
+# ====================================================================
+# 语义与改造前逐行一致，仅存储介质随 settings.REALTIME_BUS 变化：
+#   local / hub → 进程内 deque + 进程内 seq（= 改造前）
+#   forward     → 不入环、seq 由 hub 权威分配（本进程计数不权威）
+#   redis       → Redis INCR 序号 + ZSET 环形缓冲
 
 
 def _next_seq() -> int:
-    global _seq_value
-    with _seq_lock:
-        _seq_value += 1
-        return _seq_value
+    """分配下一个序号（模式语义见 bus.allocate_seq）。
+
+    广播路径不要单独调用它再 `_push_ring`：请用 `bus.assign_seq_and_ring` /
+    `bus.setdefault_seq_and_ring`，它们把取号与入环放在同一临界区（修复并发广播时
+    环内 seq 可能非单调的既有缺陷）。
+    """
+    return bus.allocate_seq()
 
 
 def _current_seq() -> int:
-    with _seq_lock:
-        return _seq_value
+    return bus.current_seq()
 
 
 def _push_ring(event, data: dict, room: str | None) -> None:
-    entry = {
-        "event": event,
-        "data": data,
-        "room": room,
-        "seq": data.get("seq"),
-        "ts_ms": data.get("ts"),
-    }
-    with _ring_lock:
-        _event_ring.append(entry)
-        _ring_seqs.append(data.get("seq"))
+    """写入重放环形缓冲（forward 进程不入环：权威环在 hub 进程）。
 
-
-def _bisect_right_seqs(target: int) -> int:
-    """在单调递增的 _ring_seqs 上二分，返回首个 seq > target 的下标。"""
-    lo, hi = 0, len(_ring_seqs)
-    while lo < hi:
-        mid = (lo + hi) // 2
-        if _ring_seqs[mid] <= target:
-            lo = mid + 1
-        else:
-            hi = mid
-    return lo
+    保留为低层入口；广播路径已改用 `bus.assign_seq_and_ring` /
+    `bus.setdefault_seq_and_ring`（取号 + 入环原子完成）。
+    """
+    bus.push_ring(event, data, room)
 
 
 def replay_since(last_seq: int) -> list[dict]:
-    with _ring_lock:
-        # 二分定位首个 > last_seq 的条目，仅返回其后（通常远小于环长），避免 O(N) 线性扫描
-        idx = _bisect_right_seqs(last_seq)
-        return list(islice(_event_ring, idx, None))
+    """补发 seq > last_seq 的事件（local/hub=进程内环，redis=ZSET）。
+
+    `sync:replay` 只在持有 socket 的进程里被调用（hub / 单进程），forward 进程
+    不服务重放，因此这里直接委托总线。
+    """
+    return bus.replay_since(last_seq)
 
 
 def server_seq() -> int:
-    return _current_seq()
+    return bus.current_seq()
 
 
 # ====================================================================
@@ -211,8 +218,11 @@ def _run_coro_on_loop(coro) -> bool:
     return True
 
 
-def _emit_sio(event: str, payload: dict, room: str | None = None) -> None:
-    """把事件投递到 sio；loop 未就绪或失败静默。"""
+def _deliver_local(event: str, payload, room: str | None = None) -> None:
+    """本进程投递原语：把事件投到已注册的 ASGI loop（= 改造前的 _emit_sio 本体）。
+
+    由 `bus` 在 local/hub（以及「受理转发」）分支调用；loop 未就绪或失败静默。
+    """
     try:
         from .gateway import sio
     except Exception:  # noqa: BLE001
@@ -237,7 +247,21 @@ def _emit_sio(event: str, payload: dict, room: str | None = None) -> None:
     except RuntimeError:
         pass  # 无运行中 loop → 走 run_coroutine_threadsafe
 
+    # 无可用 ASGI loop（管理命令 / migrate / 单元测试）：直接返回，避免创建出
+    # 永不 await 的协程而触发 RuntimeWarning（行为与原先的静默降级一致）。
+    if _get_loop_safe() is None:
+        return
     _run_coro_on_loop(_do_emit())
+
+
+def _emit_sio(event: str, payload, room: str | None = None) -> None:
+    """兼容入口（widget_packages 等直接调用）：交给总线按模式分派投递。
+
+    与改造前一致：**不含 seq、不入环**（`replay=False`，纯即时通知）。
+    local/hub 下行为与改造前的 `sio.emit` 投递完全相同；forward/redis 下由总线
+    转发/发布，修掉「多进程后这类即时通知静默丢失」的问题。
+    """
+    bus.deliver(event, payload, room, replay=False)
 
 
 # ====================================================================
@@ -293,7 +317,9 @@ def emit_resource_changed(
         room = f"comp-{competition_id}"
 
     def _deliver() -> None:
-        # seq / ts 在提交后才取，确保客户端按 seq 重放的顺序与落库顺序一致
+        # seq / ts 在提交后才取，确保客户端按 seq 重放的顺序与落库顺序一致；
+        # 「取号 + 入环」由 bus.assign_seq_and_ring 在同一临界区内原子完成
+        # （修复并发广播时环内 seq 可能非单调的既有缺陷；事件字段集合与取值不变）
         payload = {
             "resource": resource,
             "id": (
@@ -304,11 +330,11 @@ def emit_resource_changed(
             "ids": resolved_ids,
             "action": action,
             "competitionId": competition_id,
-            "seq": _next_seq(),
             "ts": int(time.time() * 1000),
         }
-        _push_ring(EVENT_RESOURCE_CHANGED, payload, room)
-        _emit_sio(EVENT_RESOURCE_CHANGED, payload, room=room)
+        bus.assign_seq_and_ring(EVENT_RESOURCE_CHANGED, payload, room)
+        # replay=True：该事件在本地模式下入环，转发给 hub 时同样要入环（断线可补发）
+        bus.deliver(EVENT_RESOURCE_CHANGED, payload, room, replay=True)
 
     _after_commit(_deliver)
 
@@ -338,18 +364,20 @@ def emit_resource_changed_to_users(
             "ids": resolved_ids,
             "action": action,
             "competitionId": competition_id,
-            "seq": _next_seq(),
             "ts": int(time.time() * 1000),
         }
+        # 只取号（统一覆盖），**不入环**（= 改造前语义：每用户独立房间不参与重放）
+        bus.assign_seq(payload)
         for uid in targets:
-            _emit_sio(EVENT_RESOURCE_CHANGED, payload, room=f"user-{uid}")
+            # replay=False：与改造前一致，此类事件从不入环（否则重连会重复消费）
+            bus.deliver(EVENT_RESOURCE_CHANGED, payload, f"user-{uid}", replay=False)
 
     _after_commit(_deliver)
 
 
 def emit_to_users(user_ids, event: str, data) -> None:
     for uid in user_ids or []:
-        _emit_sio(event, data, room=f"user-{uid}")
+        bus.deliver(event, data, f"user-{uid}", replay=False)
 
 
 async def kick_user_sessions_async(user_id: int, reason: str) -> None:
@@ -381,10 +409,12 @@ def kick_user_sessions(user_id: int, reason: str = "token_version_mismatch") -> 
     """同步入口：把某账号的所有在线会话踢下线（loop 未就绪时静默跳过）。
 
     调用场景：登录顶号、管理员重置密码、管理员禁用账号。
+    实际投递由 `bus.kick_user_sessions` 按模式分派：local/hub 本进程执行（= 改造前）；
+    forward，或 redis 且配了 REALTIME_FORWARD_URL 时，由 hub 代执行断开（否则进程分离
+    或 Redis 多进程下只发通知、不断开，I-01/I-03 失效）；纯 redis 无 forward URL 时
+    只能跨进程送达 auth:required（已知限制，见 bus.py 模块 docstring）。
     """
-    if user_id is None:
-        return
-    _run_coro_on_loop(kick_user_sessions_async(int(user_id), reason))
+    bus.kick_user_sessions(user_id, reason)
 
 
 def emit_to_competition(competition_id: int | None, event: str, data) -> None:
@@ -396,23 +426,60 @@ def emit_to_competition(competition_id: int | None, event: str, data) -> None:
     if competition_id is None:
         return
     # 同样延迟到提交后：财年推进等事件常与业务写入同处一个事务
-    _after_commit(lambda: _emit_sio(event, data, room=f"comp-{competition_id}"))
+    # replay=False：改造前该事件不入环，保持逐事件一致
+    _after_commit(
+        lambda: bus.deliver(event, data, f"comp-{competition_id}", replay=False)
+    )
+
+
+# ====================================================================
+# 系统门禁事件（快照 / 强制暂停 / 回退）
+# ====================================================================
+def emit_system_event(
+    event: str,
+    payload: dict | None = None,
+    *,
+    replay: bool = True,
+    room: str | None = None,
+) -> None:
+    """广播系统级事件（默认全局房间，进入环形缓冲以便断线重连补发）。
+
+    - 全局事件会进入 `replay_since` 的环形缓冲，客户端断线重连后 `sync:replay`
+      仍能补到「刚才被强制暂停 / 已回退完成」这类关键事件；
+    - seq / ts 在事务提交后才分配，保证补发顺序与实际提交顺序一致。
+    """
+    base = dict(payload or {})
+
+    def _deliver() -> None:
+        data = dict(base)
+        data.setdefault("ts", int(time.time() * 1000))
+        if replay:
+            # 取号（已有则沿用）+ 入环，同一临界区内原子完成
+            bus.setdefault_seq_and_ring(event, data, room)
+        else:
+            # 只补 seq、不入环（与改造前 replay=False 的行为一致）
+            bus.setdefault_seq(data)
+        bus.deliver(event, data, room, replay=replay)
+
+    _after_commit(_deliver)
+
+
+def emit_system_restored(restored: dict) -> None:
+    """回退成功后的一次性通知（客户端据此清缓存并整体重载）。"""
+    emit_system_event(EVENT_SYSTEM_RESTORED, restored)
 
 
 # ====================================================================
 # permissions:changed
 # ====================================================================
 def emit_permissions_changed(user_id: int, permission_version: int) -> None:
-    seq = _next_seq()
     ts_ms = int(time.time() * 1000)
     payload = {
         "userId": user_id,
         "version": permission_version,
-        "seq": seq,
         "ts": ts_ms,
     }
     room = f"user-{user_id}"
-    _push_ring(EVENT_PERMISSIONS_CHANGED, payload, room)
-    _emit_sio(EVENT_PERMISSIONS_CHANGED, payload, room=room)
-
-
+    # 取号 + 入环原子完成（并发下环内 seq 严格单调）
+    bus.assign_seq_and_ring(EVENT_PERMISSIONS_CHANGED, payload, room)
+    bus.deliver(EVENT_PERMISSIONS_CHANGED, payload, room, replay=True)

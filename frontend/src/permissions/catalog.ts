@@ -32,6 +32,13 @@ const CONTRACT_ACTION_RANKS: Record<string, number> = {
   manage: 40,
 };
 
+// 快照域自定义等级：restore（强制暂停 + 回退）最高，持有 restore 蕴含 manage / view。
+const SNAPSHOT_ACTION_RANKS: Record<string, number> = {
+  view: 10,
+  manage: 20,
+  restore: 30,
+};
+
 export const PERMISSION_CATALOG: PermissionDomain[] = [
   { key: "competition", label: "比赛管理", group: "比赛", actions: [{ key: "competition:manage", action: "manage", label: "管理（增删改）" }] },
   { key: "data:material", label: "原料管理", group: "数据", actions: [ { key: "data:material:view", action: "view", label: "查看" }, { key: "data:material:edit", action: "edit", label: "编辑（增删改）" } ] },
@@ -53,6 +60,7 @@ export const PERMISSION_CATALOG: PermissionDomain[] = [
   { key: "account", label: "账户管理", group: "系统", actions: [{ key: "account:manage", action: "manage", label: "管理（增删改账号与权限）" }] },
   { key: "message", label: "消息中心", group: "消息", actions: [ { key: "message:view", action: "view", label: "查看（收件箱/已发布/接收弹窗）" }, { key: "message:manage", action: "manage", label: "管理（发布/删除消息）" } ] },
   { key: "stock", label: "股票系统", group: "股票", actions: [ { key: "stock:view", action: "view", label: "查看行情" }, { key: "stock:edit", action: "edit", label: "低级管理" }, { key: "stock:manage", action: "manage", label: "高级管理" } ] },
+  { key: "snapshot", label: "快照与回退", group: "系统", actionRank: SNAPSHOT_ACTION_RANKS, actions: [ { key: "snapshot:view", action: "view", label: "查看快照列表 / 详情 / 校验" }, { key: "snapshot:manage", action: "manage", label: "创建 / 删除 / 清理快照，设置保留策略" }, { key: "snapshot:restore", action: "restore", label: "强制暂停全体并回退数据" } ] },
 ];
 
 function domainOf(key: string): string { const p = key.split(":"); return p.slice(0, -1).join(":"); }

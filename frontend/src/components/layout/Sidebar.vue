@@ -209,6 +209,17 @@
         <span>审计日志</span>
       </el-menu-item>
 
+      <el-menu-item v-if="authStore.can('snapshot:view')" index="/snapshots">
+        <el-icon><Camera /></el-icon>
+        <span>快照与回退</span>
+        <el-badge
+          v-if="gateStore.blocked"
+          class="msg-badge"
+          type="danger"
+          value="暂停中"
+        />
+      </el-menu-item>
+
       <el-menu-item index="/settings">
         <el-icon><Tools /></el-icon>
         <span>系统设置</span>
@@ -224,11 +235,13 @@ import { storeToRefs } from "pinia";
 import { useAuthStore } from "@/stores/auth";
 import { useCompetitionStore } from "@/stores/competition";
 import { useMessageStore } from "@/stores/message";
+import { useGateStore } from "@/stores/gate";
 
 const route = useRoute();
 const authStore = useAuthStore();
 const compStore = useCompetitionStore();
 const messageStore = useMessageStore();
+const gateStore = useGateStore();
 const { unreadCount } = storeToRefs(messageStore);
 
 // 抽屉模式（平板/手机）：由父级 AppLayout 控制显隐，侧栏脱离文档流浮层展示。

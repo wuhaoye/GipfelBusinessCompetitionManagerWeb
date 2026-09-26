@@ -55,7 +55,7 @@ TOKEN=$(curl -s -X POST http://127.0.0.1:8000/api/auth/login \
   -d '{"username":"admin","password":"admin23"}' | jq -r .data.token)
 
 # 此时若直接访问受保护接口会 401 initial_password_must_be_changed
-# 先改密（响应里会带回新 token + user，直接续接；详见 [apps/auth/views.py](../apps/auth/views.py)）：
+# 先改密（响应里会带回新 token + user，直接续接；详见 [apps/auth/views.py](apps/auth/views.py)）：
 curl -s -X POST http://127.0.0.1:8000/api/auth/change-password \
   -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
@@ -112,6 +112,7 @@ stock → competitions + companies + users
 files → common
 announcements → common
 widget_packages → common
+snapshots → common + realtime（快照/回退/全局门禁，注册表自动纳入上面全部业务模型）
 ```
 
 > `apps.messages` label 显式取 `gipfel_messages`，避免与 `django.contrib.messages` 冲突。
@@ -164,6 +165,22 @@ widget_packages → common
 - **防连板硬约束（S10）**：上一轮封板（|涨跌| ≥ 9.9%）时本轮同侧限幅收紧为 `min(limitPct×0.94, 9.4%)`——无论玩家如何挂单、无论 limitPct 配置多大，连续涨停/跌停在数学上不可能；定价与 K 线上下界同步生效。
 - **做市商（S11）**：每轮撮合前自动生成买卖挂单提供流动性（深度按总股本 × `mmDepthPct` 自动计算，钳制在 `mmMinQty`~`mmMaxQty`）；报价含**反向动量偏置**（`mmSkewPct`，上轮涨 → 挂单整体下移逢高派发、跌 → 上移逢低承接，封板次轮加倍）、**波动自适应价差**（|上轮涨跌| 越大价差越宽，封顶 2 倍）、**分级回归锚干预**（连续封板 ≥2 轮挂大单对冲，量随连续轮数放大）。
 - **推进入口**：管理端「推进一轮」按钮为全自动（无需填参，做市商与引擎参数取比赛 `stockConfig` 或默认值）；「自定义参数推进」弹窗可临时覆盖。
+
+## 快照与回退（apps.snapshots）
+
+全库快照 + 强制暂停 + 整体回退 + 全客户端版本同步。要点：
+
+- **注册表**（`apps/snapshots/registry.py`）自动纳入 `apps.*` 下全部业务模型并按外键依赖做拓扑排序，
+  新增业务模型**无需改动快照代码**；快照系统自身的 4 张表不参与快照/回退。
+- **归档**：`backend/snapshots/snap-XXXXXX/`（`manifest.json` + `tables/*.jsonl.gz` + 可选 `files/`），
+  逐表 sha256，回退后重算比对，不一致即整体回滚。
+- **强制暂停**：`SnapshotGateMiddleware` 在 `PAUSED` 拒绝写请求（423）、`RESTORING` 拒绝全部请求；
+  放行的写请求计入「在途写请求」计数器，暂停时先翻转状态再等计数器归零（静止点）。
+- **同步**：回退成功 `SystemGate.data_version` +1，广播 `system:restored` / `system:resumed`，
+  前端清空 IndexedDB 缓存并整体重载。
+- **命令行**：`manage.py snapshot_auto`（定时快照 + 保留清理）、`manage.py snapshot_restore`（应急回退）。
+
+完整设计、接口契约与运维手册见 **[docs/SNAPSHOT_SYSTEM.md](../docs/SNAPSHOT_SYSTEM.md)**。
 
 ## 数据库迁移
 

@@ -66,7 +66,6 @@ class X10LibTests(unittest.TestCase):
     def test_rollback_hint_helper_exists(self):
         self.assertIn("print_rollback_hint() {", self.lib)
         for needle in (
-            "systemctl stop gipfel gipfel-logviewer",
             "git -C",
             "pip",
             "npm ci",
@@ -74,6 +73,23 @@ class X10LibTests(unittest.TestCase):
             "只含数据",
         ):
             self.assertIn(needle, self.lib, f"回滚指引缺少：{needle}")
+
+        # 停服命令：C1-a 之后**写这个库的进程从 2 个变成 3 个**（多了 gunicorn/WSGI，
+        # 且它是 /api/ 的主力写入方），所以这里不再写死 "gipfel gipfel-logviewer" 字面量，
+        # 而改为断言「同一条停服命令必须覆盖三个进程」——要求比原来更严，而不是放宽。
+        stop_lines = [ln for ln in self.lib.splitlines() if "systemctl stop" in ln]
+        self.assertTrue(stop_lines, "回滚指引必须给出停服命令（先停服再动库）")
+        self.assertTrue(
+            any(
+                all(s in ln for s in ("gipfel", "gipfel-wsgi", "gipfel-logviewer"))
+                for ln in stop_lines
+            ),
+            f"停服命令必须同时停掉 daphne/WSGI/日志查看器三个写库进程：{stop_lines}",
+        )
+
+        # C2 阶段 1 起库是 WAL 模式：恢复前必须删 -wal/-shm 残留（否则旧 WAL 会被重放到恢复出来的库上）
+        self.assertIn("db.sqlite3-wal", self.lib, "恢复指引必须删 -wal 残留")
+        self.assertIn("db.sqlite3-shm", self.lib, "恢复指引必须删 -shm 残留")
 
 
 class X10StaticTests(unittest.TestCase):

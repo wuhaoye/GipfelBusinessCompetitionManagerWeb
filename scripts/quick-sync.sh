@@ -312,4 +312,16 @@ done
 log_info "同步完成！"
 echo ""
 log_info "如需重启服务，请在目标服务器执行："
-log_info "  sudo systemctl restart gipfel gipfel-logviewer"
+log_info "  sudo systemctl restart gipfel gipfel-wsgi gipfel-logviewer"
+# ★ WAL 提示（C2 阶段 1 起 SQLite 默认 journal_mode=WAL）：
+#   push 方向已用 VACUUM INTO 快照（自洽、不含 -wal），是安全的；
+#   但 **pull 方向是直接覆盖目标机的 db.sqlite3**：目标机服务若仍在跑，它旁边的
+#   db.sqlite3-wal/-shm 会被 SQLite 当成"新库的未提交事务"重放 → 库内容被带偏甚至损坏。
+#   本脚本不改服务状态（只同步数据），故在此明确给出正确顺序。
+if [[ "$ACTION" == "pull" ]]; then
+    log_warn "★ WAL 注意：pull 会覆盖目标机的 backend/db.sqlite3，请务必按此顺序操作："
+    log_warn "  1) sudo systemctl stop gipfel gipfel-wsgi gipfel-logviewer"
+    log_warn "  2) sudo rm -f <安装目录>/backend/db.sqlite3-wal <安装目录>/backend/db.sqlite3-shm"
+    log_warn "  3) 再执行本次 pull（或确认已 pull 完成后删除上面两个文件）"
+    log_warn "  4) sudo systemctl start gipfel gipfel-wsgi gipfel-logviewer"
+fi

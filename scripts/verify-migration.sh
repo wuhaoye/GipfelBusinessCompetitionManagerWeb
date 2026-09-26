@@ -111,9 +111,18 @@ echo ""
 echo "[2/5] 检查系统服务..."
 
 if systemctl is-active --quiet gipfel 2>/dev/null; then
-    check_pass "gipfel 服务运行中"
+    check_pass "gipfel 服务运行中（daphne :8000，承载 /socket.io/）"
 else
     check_warn "gipfel 服务未运行"
+fi
+
+# C1-a：/api/ 的实际承载者是多 worker 的 gunicorn(WSGI)，与 daphne 是两个独立 unit。
+# 只检查 gipfel：会出现"daphne 活着、WSGI 没起来"的迁移结果被判为成功，
+# 而现场表现是登录/接口全 502（实时推送却正常），排查方向会被完全带偏。
+if systemctl is-active --quiet gipfel-wsgi 2>/dev/null; then
+    check_pass "gipfel-wsgi 服务运行中（gunicorn，承载 /api/、/admin/）"
+else
+    check_warn "gipfel-wsgi 服务未运行（/api/ 会 502）"
 fi
 
 if systemctl is-active --quiet gipfel-logviewer 2>/dev/null; then
@@ -134,11 +143,29 @@ echo ""
 echo "[3/5] 检查 API 响应..."
 
 if command -v curl >/dev/null 2>&1; then
-    response=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8000/api/health 2>/dev/null || echo "000")
+    # C1-a：/api/ 现在由 gunicorn(WSGI) 承载，端口取 backend/.env 的 GIPFEL_WSGI_PORT（默认 8002，
+    # 与 deploy/gipfel-wsgi.service 的 Environment 默认值、nginx upstream gipfel_django 同源）。
+    wsgi_port=""
+    if [[ -f "$INSTALL_DIR/backend/.env" ]]; then
+        wsgi_port=$(grep -E '^[[:space:]]*GIPFEL_WSGI_PORT[[:space:]]*=' "$INSTALL_DIR/backend/.env" \
+            | tail -1 | sed -E 's/^[^=]*=[[:space:]]*//; s/[[:space:]]*$//; s/^"//; s/"$//' || true)
+    fi
+    wsgi_port="${wsgi_port:-8002}"
+    response=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:${wsgi_port}/api/health" 2>/dev/null || echo "000")
     if [[ "$response" == "200" ]]; then
-        check_pass "API 健康检查通过 (HTTP 200)"
+        check_pass "WSGI(gunicorn :${wsgi_port}) API 健康检查通过 (HTTP 200)"
     else
-        check_fail "API 健康检查失败 (HTTP $response)"
+        check_fail "WSGI(gunicorn :${wsgi_port}) API 健康检查失败 (HTTP $response)"
+    fi
+
+    # C1-a：daphne(ASGI) 的职责是 Socket.IO，用 HTTP 握手探活（期望 200）——
+    # 只看 systemctl 状态无法区分"进程活着但 ASGI 应用起不来"。
+    io_resp=$(curl -s -o /dev/null -w "%{http_code}" \
+        "http://127.0.0.1:8000/socket.io/?EIO=4&transport=polling" 2>/dev/null || echo "000")
+    if [[ "$io_resp" == "200" ]]; then
+        check_pass "daphne(:8000) Socket.IO 握手通过 (HTTP 200)"
+    else
+        check_fail "daphne(:8000) Socket.IO 握手失败 (HTTP $io_resp) —— 实时推送不可用"
     fi
 
     # 审计 X-09：改前只验证主应用的 `/api/health` —— 日志查看器（`gipfel-logviewer`）

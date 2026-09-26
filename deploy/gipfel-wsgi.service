@@ -1,0 +1,98 @@
+[Unit]
+Description=Gipfel Business Competition Manager (gunicorn WSGI)
+# C1-a：HTTP 短请求与 Socket.IO 长连接拆成两组进程。
+#   · 本 unit（gunicorn/WSGI）承载 /api/*、/admin/* 等同步视图 —— 多 worker 多线程，
+#     不再让全场请求排队给 Django async 的单线程执行器（C1 的根因）。
+#   · daphne（deploy/gipfel.service）继续承载 /socket.io/* 长连接。
+# After 里带上 gipfel.service 只是**排序**（同一批启动时先起 daphne）：WSGI 侧的
+# REALTIME_BUS=forward 要把事件转发给 daphne 的 hub（:8000）；但即使 daphne 还没就绪，
+# 转发失败也只是丢事件 + warning，不阻断业务请求，故不需要 Wants/Requires 强依赖。
+After=network.target remote-fs.target nss-lookup.target gipfel.service
+Wants=network.target
+
+[Service]
+Type=simple
+# 建议使用专用用户：sudo useradd -r -s /usr/sbin/nologin gipfel
+User=gipfel
+Group=gipfel
+
+# 工作目录 = backend 根目录（manage.py 所在目录）
+WorkingDirectory=__INSTALL_DIR__/backend
+
+# ★ 顺序有语义：`Environment=` 写默认值，`EnvironmentFile=`（backend/.env）在后。
+#   systemd 中 EnvironmentFile 的值**优先级更高**，所以运维只需要在 .env 里写
+#   REALTIME_BUS=redis / GIPFEL_WSGI_WORKERS=8 就能覆盖这里的默认值，而不必改 unit
+#   （unit 属于仓库文件，升级会被覆盖）。反过来说，把默认值放到 EnvironmentFile 之后
+#   也不会改变优先级，但会让人误以为"后写的生效"——这里刻意保持默认值在前。
+#
+# C1-a 总线：WSGI 进程自己 emit 的事件推不到 daphne 的连接上，故默认 forward 到 daphne
+# 的内部转发端点（POST http://127.0.0.1:8000/_internal/realtime/emit）。排队在独立后台线程，
+# 业务请求不等待；.env 里显式写 REALTIME_BUS=redis + REALTIME_REDIS_URL 时两端一起覆盖为 redis。
+Environment="PATH=__INSTALL_DIR__/backend/.venv/bin"
+Environment="REALTIME_BUS=forward"
+Environment="REALTIME_FORWARD_URL=http://127.0.0.1:8000"
+# gunicorn 参数默认值（.env 可覆盖；脚本侧用同一个键名做健康检查与自检）
+Environment="GIPFEL_WSGI_PORT=8002"
+Environment="GIPFEL_WSGI_WORKERS=4"
+Environment="GIPFEL_WSGI_THREADS=8"
+Environment="GIPFEL_WSGI_TIMEOUT=120"
+EnvironmentFile=-__INSTALL_DIR__/backend/.env
+
+# 启动 gunicorn（WSGI）：只绑回环，由 nginx 反代（upstream gipfel_django → 127.0.0.1:8002）。
+#   · --worker-class gthread + --threads 8：同步视图（ORM 阻塞）在线程里并发执行，
+#     4 worker × 8 线程 = 32 路并发，直接解决"8 个并发请求 = 1 个线程 = 1.61s 串行"。
+#     （红线：不给同步视图加 async_to_sync 包装、不依赖 thread_sensitive=False 混用。）
+#   · 不要改成 `-k gevent/eventlet`：项目未装对应依赖，且同步 ORM 在 monkey-patch 下有风险。
+#   · --timeout 默认 120s：与 nginx /api/ 的 proxy_read_timeout 120s 对齐，避免 nginx 先断。
+#   · 访问日志写 ${LOGS_DIRECTORY}（= LogsDirectory=gipfel-wsgi 对应的 /var/log/gipfel-wsgi），
+#     与 daphne 的 access.log 分开，避免两个服务抢同一个文件。
+ExecStart=__INSTALL_DIR__/backend/.venv/bin/gunicorn \
+    --bind 127.0.0.1:${GIPFEL_WSGI_PORT} \
+    --workers ${GIPFEL_WSGI_WORKERS} \
+    --worker-class gthread \
+    --threads ${GIPFEL_WSGI_THREADS} \
+    --timeout ${GIPFEL_WSGI_TIMEOUT} \
+    --graceful-timeout 30 \
+    --access-logfile ${LOGS_DIRECTORY}/wsgi.access.log \
+    --error-logfile - \
+    --capture-output \
+    backend.wsgi:application
+
+# 运行目录（pid/运行时状态）与日志目录；systemd 在启动前自动创建。
+# 审计 X-13 的结论同样适用于本 unit：运行/日志目录**不得**与其它服务共用
+#   （共用时 restart 一个服务会连带清理/重建另一个服务的目录），模式统一收紧为 0750，
+#   并补 UMask=0027，确保服务自身新建的文件也不对其他用户开放。
+RuntimeDirectory=gipfel-wsgi
+RuntimeDirectoryMode=0750
+LogsDirectory=gipfel-wsgi
+LogsDirectoryMode=0750
+UMask=0027
+
+Restart=always
+RestartSec=3s
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# 沙箱加固（M9/M9 系列，与 gipfel.service 对齐）：最小权限 + 文件系统只读 + 仅开放必要可写路径
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+# 注意：必须包含 AF_INET（`--bind 127.0.0.1` 与本服务向外转发事件的 TCP 连接）与 AF_INET6；
+# 若缺失，内核会以 EAFNOSUPPORT（Errno 97）拒绝创建套接字，服务启动即失败并无限重启。
+# AF_UNIX 保留：名称解析（nss）、日志与 systemd 通知等仍可能在用。
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+# 只保留主应用真正需要可写的路径（与 gipfel.service 同一套数据目录：
+# 两个进程共享同一个 SQLite 库与 uploads/logs/snapshots —— C2 阶段 1 的 WAL + busy_timeout
+# 正是为这种"多进程写同一库"的场景准备的）。
+# snapshots/ 为快照归档目录（apps.snapshots）：缺失会导致回退/快照写入 PermissionError。
+ReadWritePaths=__INSTALL_DIR__/backend/uploads __INSTALL_DIR__/backend/logs __INSTALL_DIR__/backend/snapshots __INSTALL_DIR__/backend/db.sqlite3 /run/gipfel-wsgi /var/log/gipfel-wsgi
+
+[Install]
+WantedBy=multi-user.target

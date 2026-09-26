@@ -1,6 +1,6 @@
 # Gipfel 商赛系统 · 运维文档（OPS）
 
-面向运维人员的日常操作手册。架构、目录结构、API 契约见 [`README.md`](README.md)；部署步骤见 [`deploy/README.md`](deploy/README.md)。
+面向运维人员的日常操作手册。架构、目录结构、API 契约见 [`README.md`](../README.md)（项目入口）与 [本目录文档索引](README.md)；部署步骤见 [`deploy/README.md`](../deploy/README.md)。
 
 ---
 
@@ -9,8 +9,11 @@
 | 服务 | 端口 | 说明 |
 | --- | --- | --- |
 | 前端（Vite / 生产 nginx 静态） | `:5173`（开发）/ 80·443（生产） | 浏览器访问入口 |
-| 后端（Django 5 + daphne ASGI） | `:8000` | HTTP REST + Socket.IO WebSocket 同源同端口；`/admin` 管理后台仅前端按钮携带一次性令牌可进，直连 302 回前端 |
+| 后端 REST（Django 5 + gunicorn WSGI，**多 worker**） | `:8002`（仅回环，`deploy/gipfel-wsgi.service`） | 生产 nginx 把 `/api/`、`/admin/` 反代到这里 —— C1-a 整改后 REST 不再挤在单线程 ASGI 执行器上 |
+| 后端实时（Django 5 + daphne ASGI） | `:8000`（仅回环，`deploy/gipfel.service`） | nginx 把 `/socket.io/` 反代到这里；同时仍挂载完整 Django（回环直连的健康检查、contract_watcher、`manage.py rundaphne` 兼容路径不变） |
 | 日志查看器（独立 Django 站点） | `:8121`（daphne 内部，仅绑 127.0.0.1，service 模板硬编码）/ `.env` 的 `LOG_VIEWER_PORT` 决定 nginx 公网监听端口（默认 `:8120`） | 在线查看 `backend/logs/`，**共享主后端 `db.sqlite3`**；公网整站代理到 `127.0.0.1:8121`，且**仅前端按钮点击（携带一次性令牌）可进入**，直接输入网址被 403 拒绝。有域名经 nginx 子域 `log.<DOMAIN>`（端口 80）；无域名（纯 IP）经 nginx `LOG_VIEWER_PORT` 端口（`server_name _`，默认 8120）访问 `http://<IP>:8120/`（详见 deploy/README.md「无域名纯 IP 部署」） |
+
+> 两个后端进程的职责与上游映射见 §12（C1-a 整改要点）。开发态（Windows `start-dev.bat`）**不变**：仍是单进程 daphne `:8000`，HTTP + Socket.IO 同源同端口，`REALTIME_BUS` 默认解析为 `local`（进程内广播，与改造前完全一致）。
 
 > 后端 `:8000` 由 `start-dev.bat` 固定，不读 `.env` 的 `PORT`；`PORT` 仅被 `manage.py rundaphne` 与 `/api/version` 下发的跳转按钮使用。`.env` 的 `LOG_VIEWER_PORT`（默认 8120）**真正控制** nginx 公网监听端口（deploy 脚本渲染 vhost 时替换 `__LOG_VIEWER_PORT__` 占位符），并随 `/api/version` 下发给前端按钮拼 `log_viewer_url`。**daphne 实际绑定的内部端口是 127.0.0.1:8121**（`deploy/logviewer.service` 模板硬编码）——与 `LOG_VIEWER_PORT` **故意解耦**，避免 nginx 与 daphne 同机抢端口。改 `LOG_VIEWER_PORT` 改的是公网端口，8121 内部端口不变；防火墙 ufw 规则随新值自动清理/重建。
 
@@ -25,14 +28,20 @@
 ### 3.1 Linux（生产，systemd）
 
 ```bash
-systemctl start gipfel        # 后端 daphne
-systemctl stop gipfel         # 停止
-systemctl restart gipfel      # 重启（改代码/配置后）
-systemctl status gipfel       # 状态
+systemctl start gipfel        # 后端 daphne（Socket.IO，:8000）
+systemctl start gipfel-wsgi   # 后端 gunicorn WSGI（REST / admin，:8002）★ C1-a 新增
+systemctl stop gipfel gipfel-wsgi    # 停止（两个进程都要停）
+systemctl restart gipfel gipfel-wsgi # 重启（改代码/配置后）
+systemctl status gipfel              # 状态（ASGI / Socket.IO）
+systemctl status gipfel-wsgi         # 状态（WSGI / REST）
 systemctl status gipfel-logviewer   # 日志查看器（独立站点）
 systemctl status nginx        # 反向代理 + 前端静态
-journalctl -u gipfel -f       # 实时日志
+journalctl -u gipfel -f       # 实时日志（Socket.IO 进程）
+journalctl -u gipfel-wsgi -f  # 实时日志（REST 进程）
 ```
+
+> **只重启一个是常见事故**：只 restart `gipfel` 时 REST 仍是旧代码（`/api/*` 走 `gipfel-wsgi`），
+> 现象是「改了后端但接口行为一字未变」。部署脚本已改为同时刷新并重启两个单元。
 
 ### 3.2 Windows（开发）
 
@@ -44,7 +53,7 @@ scripts\stop-dev.bat          :: 兜底强停：监管窗口被强关（X / 任�
 
 停止：在 **Gipfel Dev** 监管窗口按一次 `Ctrl+C`，Django / Vite / 日志查看器会一起优雅退出，窗口随之关闭。
 
-> **为什么不再用批处理的 `start /B` 直接拉服务**：`start` 会把子进程放进**新的进程组**，控制台 Ctrl+C 不会投递给它们（服务照常运行、8000/5173/8120 只增不减），而 cmd.exe 自己会停在「终止批处理操作吗(Y/N)?」——窗口看起来就是卡死，按 Y 之后服务仍在跑。监管逻辑因此移入 [scripts/dev.py](scripts/dev.py)：子进程依旧以 `CREATE_NEW_PROCESS_GROUP` 启动，退出时由监管进程对每个子进程组**定向**发送 `CTRL_BREAK_EVENT` 优雅停止（daphne 收到 SIGBREAK 会正常关闭 reactor），8s 内没退再 `taskkill /PID <pid> /T /F` 兜底；子进程 PID 写入 `%TEMP%\gipfel-dev.pids`，供 `scripts\stop-dev.bat` 兜底强杀。
+> **为什么不再用批处理的 `start /B` 直接拉服务**：`start` 会把子进程放进**新的进程组**，控制台 Ctrl+C 不会投递给它们（服务照常运行、8000/5173/8120 只增不减），而 cmd.exe 自己会停在「终止批处理操作吗(Y/N)?」——窗口看起来就是卡死，按 Y 之后服务仍在跑。监管逻辑因此移入 [scripts/dev.py](../scripts/dev.py)：子进程依旧以 `CREATE_NEW_PROCESS_GROUP` 启动，退出时由监管进程对每个子进程组**定向**发送 `CTRL_BREAK_EVENT` 优雅停止（daphne 收到 SIGBREAK 会正常关闭 reactor），8s 内没退再 `taskkill /PID <pid> /T /F` 兜底；子进程 PID 写入 `%TEMP%\gipfel-dev.pids`，供 `scripts\stop-dev.bat` 兜底强杀。
 
 > `start-dev.bat` 用的是 `manage.py runserver`，但 **daphne 已在 `INSTALLED_APPS` 首位并接管了 runserver 命令**，因此实际就是以 ASGI/daphne 运行，HTTP + WebSocket 同源同端口，Socket.IO 正常。
 
@@ -61,12 +70,19 @@ scripts\stop-dev.bat          :: 兜底强停：监管窗口被强关（X / 任�
 ## 5. 健康检查
 
 ```bash
-curl -sS http://127.0.0.1:8000/api/health     # 期望 {"code":0,"message":"成功","data":{"status":"ok"}}
+curl -sS http://127.0.0.1:8000/api/health     # 期望 {"code":0,"message":"成功","data":{"status":"ok"}}（daphne 仍挂完整 Django）
+curl -sS http://127.0.0.1:8002/api/health     # ★ C1-a：WSGI(REST) 进程健康检查，期望同上
+curl -sS -o /dev/null -w "%{http_code}\n" \
+  'http://127.0.0.1:8000/socket.io/?EIO=4&transport=polling'   # ★ 期望 200（Socket.IO 握手路径活着）
+curl -sS -o /dev/null -w "%{http_code}\n" http://127.0.0.1/api/health   # 经 nginx（命中 WSGI 上游），期望 200
 curl -sS http://127.0.0.1:8000/api/version    # 期望 data 内含 version / port / log_viewer_url 字段（日志查看器公网地址）
 curl -sS http://127.0.0.1:8120/api/health     # 日志查看器健康检查
 curl -sS -o /dev/null -w "%{http_code}" http://127.0.0.1:8120/   # 直连应为 403（防直连网关）
 curl -sS -o /dev/null -w "%{http_code}" http://127.0.0.1:8000/admin/   # 直连应为 302（防直连网关，Location 指向 /）
 ```
+
+> 若 `:8002/api/health` 不通而 `:8000/api/health` 正常，说明 `gipfel-wsgi` 没起来或端口被占，
+> 此时公网 `/api/*` 会 502（nginx 上游只有一个节点）；先 `systemctl status gipfel-wsgi` 看日志。
 
 ## 6. 常用运维命令
 
@@ -106,9 +122,31 @@ npm run typecheck    # 类型检查（CI 必跑）
 
 - `backend/db.sqlite3`（数据库）
 - `backend/uploads/`（上传文件）
+- `backend/snapshots/`（**快照归档**：每份快照的逐表数据 + manifest，是「一键回退」的依据；
+  升级脚本已 `--exclude snapshots` 保护，不会被动清除）
 - `backend/logs/`（日志，可选）
 
-恢复：停止服务 → 用备份覆盖上述目录 → 重启。详细回滚流程见 [`deploy/README.md`](deploy/README.md) 的「更新部署 / 回滚」一节（`deploy-linux.sh --skip-install-deps` 会自动先备份到 `/opt/gipfel/_backup/`）。
+恢复：停止服务 → 用备份覆盖上述目录 → 重启。详细回滚流程见 [`deploy/README.md`](../deploy/README.md) 的「更新部署 / 回滚」一节（`deploy-linux.sh --skip-install-deps` 会自动先备份到 `/opt/gipfel/_backup/`）。
+
+### 8.1 应用内快照与回退（推荐的首选回滚手段）
+
+除了操作系统级的文件备份，系统自带**应用内快照**能力（`apps.snapshots`）：
+
+```bash
+cd /opt/gipfel/backend
+
+# 列出快照 / 预览影响 / 应急回退（会先强制暂停全场，再整库还原）
+.venv/bin/python manage.py snapshot_restore --list
+.venv/bin/python manage.py snapshot_restore --id 12
+.venv/bin/python manage.py snapshot_restore --id 12 --yes
+
+# 定时自动快照（建议 cron 每 10 分钟跑一次，按策略判断是否到期）
+.venv/bin/python manage.py snapshot_auto
+```
+
+- 管理员也可在网页「快照与回退」页完成同样操作（含暂停/恢复、回退影响预览、归档校验与下载）。
+- 回退期间所有在线用户会被强制暂停并弹出遮罩，完成后客户端自动重载到回退后的数据。
+- 完整设计、接口与取舍见 **[快照与回退系统](SNAPSHOT_SYSTEM.md)**。
 
 ### 服务器迁移
 
@@ -303,7 +341,7 @@ sudo bash scripts/update-from-github.sh --source-dir <clone 目录> \
 ## 10. 安全与合规速览
 
 - **JWT**：HS256，`JWT_SECRET` 必填（未配置进程 fail-fast 拒绝启动），默认 24h，`tokenVersion` 顶号立即失效。Django 自身 `SECRET_KEY` 支持经 `DJANGO_SECRET_KEY` 独立配置（未配置回退 `JWT_SECRET`；更换会使 session/CSRF cookie 失效，择机轮换）。
-- **改密吊销会话**：改密成功后端递增 `token_version` 吊销**所有**旧 token（含当前会话，防止旧凭据残留）；**后端在同一次请求内直接签发新 token 并随响应返回**（[ChangePasswordView](backend/apps/auth/views.py) 改密、递增 token_version、签发新 token 三步在同一 ORM 实例上原子完成，规避 SQLite 写后读竞态），前端用响应里的 `token` 字段直接替换旧 token 即可，本设备会话无感续接，其他设备被正确踢下线。脚本/SDK 调用方须从 `change-password` 响应里取 `token` 续接。
+- **改密吊销会话**：改密成功后端递增 `token_version` 吊销**所有**旧 token（含当前会话，防止旧凭据残留）；**后端在同一次请求内直接签发新 token 并随响应返回**（[ChangePasswordView](../backend/apps/auth/views.py) 改密、递增 token_version、签发新 token 三步在同一 ORM 实例上原子完成，规避 SQLite 写后读竞态），前端用响应里的 `token` 字段直接替换旧 token 即可，本设备会话无感续接，其他设备被正确踢下线。脚本/SDK 调用方须从 `change-password` 响应里取 `token` 续接。
 - **RBAC**：39 个权限键、19 个权限域；5 级动作等级蕴含（`view<edit<manage<execute<audit`，合同域自定义）。`can(action, resource)` 前后端一致。
 - **比赛隔离**：读查询按 `competition_id` 自动域过滤（`apply_competition_scope`）；写操作 `create_competition_id` 强制归属（非超管忽略请求体 competitionId）；`CompetitionScopePermission` 挂载 DRF 全局默认兜底。
 - **客户端 IP 信任链**：`client_ip()` 仅对可信代理（默认回环，`TRUSTED_PROXIES` 可扩展）信任 `X-Real-IP`，直连后端无法伪造该头绕过登录限速。
@@ -317,7 +355,7 @@ sudo bash scripts/update-from-github.sh --source-dir <clone 目录> \
 
 ### 首次部署（Linux 一键部署）
 
-完整步骤见 [`deploy/README.md`](deploy/README.md) 的「获取源码」一节。最简流程（默认分支 `master`，纯 IP 省略 `--domain`）：
+完整步骤见 [`deploy/README.md`](../deploy/README.md) 的「获取源码」一节。最简流程（默认分支 `master`，纯 IP 省略 `--domain`）：
 
 ```bash
 # 克隆到 /opt（不要叫 /opt/gipfel，会与安装目录 rsync 自拷贝冲突）
@@ -349,7 +387,7 @@ sudo bash scripts/update-from-github.sh \
   --install-dir /opt/gipfel --with-nginx --public-ip 43.142.77.225
 ```
 
-> 脚本自动：① 拉取最新代码 ② 备份 `db.sqlite3`+`uploads`+`.env` 到 `_backup/<时间戳>` ③ 更新代码（排除数据文件）④ `pip install`+`migrate`+`collectstatic` ⑤ `npm ci`+`npm run build`→`frontend-dist/` ⑥ chown 归属 gipfel、`.env` 权限 600 ⑦ 纯 IP 自愈（`LOG_VIEWER_PUBLIC_URL` + `DJANGO_ALLOWED_HOSTS`）⑧ 刷新 systemd 单元并 restart `gipfel`(+`gipfel-logviewer`) ⑨ [--with-nginx] 刷新 vhost 并 reload。完整细节见 [`deploy/README.md`](deploy/README.md) 的「更新部署」一节。
+> 脚本自动：① 拉取最新代码 ② 备份 `db.sqlite3`+`uploads`+`.env` 到 `_backup/<时间戳>` ③ 更新代码（排除数据文件）④ `pip install`+`migrate`+`collectstatic` ⑤ `npm ci`+`npm run build`→`frontend-dist/` ⑥ chown 归属 gipfel、`.env` 权限 600 ⑦ 纯 IP 自愈（`LOG_VIEWER_PUBLIC_URL` + `DJANGO_ALLOWED_HOSTS`）⑧ 刷新 systemd 单元并 restart `gipfel`(+`gipfel-logviewer`) ⑨ [--with-nginx] 刷新 vhost 并 reload。完整细节见 [`deploy/README.md`](../deploy/README.md) 的「更新部署」一节。
 
 > ## ⚠️ 域名部署升级时**必须**带 `--domain`（上面示例默认是纯 IP 写法）
 >
@@ -372,9 +410,101 @@ python manage.py collectstatic --noinput   # 生产环境 /admin 等静态资源
 # 前端
 cd ../frontend && npm ci && npm run build
 # 重启（Linux 需先 chown -R gipfel:gipfel /opt/gipfel 并 chmod 600 .env，否则权限拒绝）
-systemctl restart gipfel        # Linux
+systemctl restart gipfel gipfel-wsgi   # Linux：两个后端进程都要重启（C1-a）
 # Windows 开发：Ctrl+C 停 start-dev.bat 后重跑
 ```
 </details>
 
 升级后务必跑一次第 5 节的健康检查。
+
+---
+
+## 12. 架构性运维约束整改（C1-a / C2 阶段1 / C3）运维要点
+
+> 依据 [`架构性运维约束整改简报.md`](架构性运维约束整改简报.md) 与
+> [`运维约束整改设计说明.md`](运维约束整改设计说明.md)（接口与边界冻结说明）。
+> 三条整改都设计成**可开关、可回退、默认不打破现状**：`.env` 不写任何新键时，行为与改造前一致。
+
+### 12.1 C1-a：HTTP 与 WebSocket 进程分离
+
+| 进程 | unit | 监听 | nginx 上游 | 承载 |
+| --- | --- | --- | --- | --- |
+| gunicorn WSGI（`-w 4 -k gthread --threads 8`） | `gipfel-wsgi` | `127.0.0.1:8002` | `gipfel_django` | `/api/`、`/admin/` |
+| daphne ASGI | `gipfel` | `127.0.0.1:8000` | `gipfel_socketio` | `/socket.io/`（同时仍挂完整 Django，回环直连兼容） |
+
+**跨进程实时广播（最容易踩的坑）**：改造前 REST 与 Socket.IO 同进程，视图里 `emit` 直接投递到
+本进程 event loop；多进程后 REST 进程推不到 daphne 的连接，必须走总线：
+
+| `.env` 配置 | 行为 | 适用 |
+| --- | --- | --- |
+| 不配（默认） | WSGI 进程把事件经回环 HTTP（`/_internal/realtime/emit`，共享密钥由 `LOGVIEWER_SECRET_KEY` 派生、仅回环可调）转发给 daphne；失败只丢事件不阻断业务 | 单机部署，零额外依赖 |
+| `REALTIME_BUS=redis` + `REALTIME_REDIS_URL=redis://…` | 两端走 Redis（`AsyncRedisManager` + Redis 序号/环形缓冲） | 多机 / 大规模；**需自行安装并守护 redis** |
+| `REALTIME_BUS=local` | 进程内广播（= 改造前），仅在**单进程**部署下正确 | 现场快速回退 |
+
+> ⚠️ 只把 `REALTIME_BUS=local` 用于单进程。多进程 + local = 前端「改完不刷新」，且不报错。
+>
+> 排查「实时不刷新」：① `systemctl status gipfel gipfel-wsgi` 两个都在跑？②
+> `journalctl -u gipfel-wsgi | grep -i "realtime\|forward"` 有无转发失败告警？③ 用两个浏览器标签 +
+> 一次写操作验证广播是否跨进程送达（简报 C1.5 验收方法）。
+
+### 12.2 C2 阶段 1：SQLite 调优与审计降噪
+
+- 新连接会执行 `PRAGMA journal_mode=WAL; synchronous=NORMAL; busy_timeout=20000;`（`apps/common/db_pragmas.py`），
+  与改造前的 `journal_mode=delete / busy_timeout=5000` 相比：读不再阻塞写、锁等待 5s→20s。
+- **WAL 仍只允许一个写者**：它改善的是「读不阻塞写」，不是写并行。写并发真正的上限要靠减少写放大（审计降噪）与后续 C2 阶段 2（PostgreSQL）。
+- ⚠️ **WAL 要求数据库在本地磁盘**：NFS / 网络盘 / 容器挂载卷上可能不可用甚至损坏。若现场 DB 在网络盘，
+  设 `SQLITE_JOURNAL_MODE=DELETE`（或 `SQLITE_TUNING_ENABLED=false`）回到改造前行为。
+- ⚠️ **备份/恢复必须用一致性快照**（仓库脚本已如此：`snapshot_sqlite_consistent` = `VACUUM INTO`）：
+  开 WAL 后，对**运行中的库**做 `cp -a db.sqlite3` 会漏掉仍在 `-wal` 里的事务。
+  手工恢复旧库时，先停服务并 `rm -f backend/db.sqlite3-wal backend/db.sqlite3-shm` 再放回备份文件。
+  `scripts/quick-sync.sh` 的 **pull 方向**会用 rsync 直接覆盖目标机 `db.sqlite3`（脚本不停服），
+  WAL 下这会留下与旧库不匹配的 `-wal/-shm`：**push 前先 `systemctl stop gipfel gipfel-wsgi`，pull 后先删残留 `-wal/-shm` 再起服务**（脚本已打印该警告，但不会替你做）。
+- 审计降噪（`.env` 的 `AUDIT_HTTP_ERROR_MODE`）：默认 `sampled` = 5xx 全量落库、4xx 按 5% 采样落库，
+  4xx 始终写文件日志。**业务写审计（`log_write`）与登录成功/失败的业务记录不受影响**。
+  现场要「每个 4xx 都落库」就设 `AUDIT_HTTP_ERROR_MODE=all`。
+  ⚠️ **赛时取证提醒**：默认 5% 采样意味着登录失败/顶号/越权等 401、403 **只有约 1/20 落库**
+  （日志文件里是全量）。若比赛期间需要完整取证，赛前设 `AUDIT_HTTP_ERROR_SAMPLE_RATE=1.0`
+  （或 `AUDIT_HTTP_ERROR_MODE=all`）；赛后排查两者都可查日志文件。
+- 审计归档（防止表无限增长拖慢写入，建议加 cron）：
+
+  ```bash
+  # 每天 03:20 归档并清理 7 天前的审计（默认 --days 取 .env 的 AUDIT_RETENTION_DAYS）
+  20 3 * * * cd /opt/gipfel/backend && sudo -u gipfel .venv/bin/python manage.py audit_archive >> logs/audit_archive.log 2>&1
+  # 先看会删多少（不删数据）：
+  sudo -u gipfel .venv/bin/python manage.py audit_archive --dry-run
+  ```
+
+- ⚠️ **升级/部署时必须"先停服，再 migrate"**（C2 阶段 1 起是硬要求）：WAL 切换要求没有其它连接持有该库；
+  若旧版本服务仍在跑（它用 rollback journal），同一库被两种日志模式并发访问会直接损坏
+  （真机实测 `database disk image is malformed`）。`scripts/deploy-linux.sh` 与 `scripts/update-from-github.sh`
+  已内置该步骤（并在失败时尽力把服务拉回运行态），**手工升级请照样做**：
+  `systemctl stop gipfel gipfel-wsgi gipfel-logviewer` → `manage.py migrate` → 起服务。
+  同理，**rsync/拷贝代码时必须排除 `db.sqlite3-wal` / `db.sqlite3-shm`**（脚本已用 `--exclude 'db.sqlite3*'`）——
+  把源目录的边车文件带到线上库旁边，会让 SQLite 拿"属于另一个库的 WAL"去恢复，同样得到 `malformed`。
+
+### 12.3 C3：心跳/重连/限流
+
+- 前端心跳改为**条件请求**：`GET /api/auth/me?light=1` + `If-None-Match`，未变更返回 304；
+  页面隐藏时心跳间隔拉长到 60s（可见 20s），重新可见时立刻补一次。稳态请求量因此大幅下降。
+- 断线重连对账：并发上限 + 指数退避 + 抖动；公司产业字段改批量端点
+  （`GET /api/company-fields?companyIds=1,2,3`，**逐个端点仍保留**，老前端/contract_watcher 不受影响）。
+- nginx 限流（`deploy/nginx-gipfel.conf`，最终数值）：
+
+  | location | limit_req | limit_conn | 说明 |
+  | --- | --- | --- | --- |
+  | `/api/` | `rate=120r/s burst=240 nodelay` | 600 | **Debian 13 真机 100 客户端压测校准**：同一 NAT 出口 IP 下 60r/s 会拦掉 10%~32% 的正常重连，120r/s+burst240 为 0 个 429；最坏 1100 请求风暴仍拦掉 709（后端全程存活）。见 `docs/真机验证报告-Debian13.md` §T3 |
+  | `= /api/auth/login` | `rate=20r/s burst=120 nodelay` | 600 | 防爆破靠应用层（同 IP+用户名 10 次/5 分钟锁 15 分钟）；nginx 只挡风暴，避免「全场同一 NAT 同时登录」被误伤 |
+  | `= /api/health` | **无** | **无** | 监控探针不得被限流 |
+  | `/socket.io/` | **无** | 200 | 长连接/心跳被限速 = 全场重连风暴 |
+
+  超限返回 **429**（`limit_req_status 429; limit_conn_status 429;`）。
+  ⚠️ 现场若「全场共用一个 NAT/Cloudflare 出口 IP」，阈值就是按「一个 IP 代表 100~200 个客户端」估算的；
+  挂 CDN 时必须先配 `set_real_ip_from` / `real_ip_header` 还原真实 IP，否则全场会被算作一个 IP。
+  出现 429 时先看 access log 的 `$request_time` 与实际速率，再按 zone 调 rate/burst，**不要直接删掉限流**。
+- 可观测性：主 server 的 access log 使用带 `$request_time` 的 `log_format`，可直接定位长请求：
+
+  ```bash
+  # 找出最慢的 20 条（最后一列是 $request_time，单位秒）
+  awk '{print $(NF), $0}' /var/log/nginx/gipfel.access.log | sort -rn | head -20
+  ```
+

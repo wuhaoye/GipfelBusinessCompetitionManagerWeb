@@ -11,6 +11,8 @@
     · 兼容前端 { competitionId } / { userId }（映射到 comp-{id} / user-{id}）
 - sync:replay：补发 lastSeq 之后的事件（环形缓冲），并返回 serverSeq
 - 顶号机制：JWT 校验失败时立刻向 user-{id} 广播 auth:required（踢现有连接下线）
+- C1-a：`REALTIME_BUS=redis` 时给 AsyncServer 挂 AsyncRedisManager（跨进程房间/事件
+  经 Redis 广播）；redis 包缺失或初始化失败 → warning + 退回单进程管理，不崩。
 
 导出 sio（AsyncServer 实例）与 application（ASGI 应用），供 asgi.py 引用。
 """
@@ -51,12 +53,47 @@ def _socketio_cors_origins():
     return items
 
 
-sio = socketio.AsyncServer(
-    async_mode="asgi",
-    cors_allowed_origins=_socketio_cors_origins(),
-    ping_interval=25,
-    ping_timeout=20,
-)
+def _build_client_manager():
+    """按总线模式决定是否给 AsyncServer 挂 Redis client_manager（C1-a）。
+
+    - 仅 `REALTIME_BUS=redis`（auto + 可用 REALTIME_REDIS_URL 也算）时挂
+      `AsyncRedisManager`，让 Socket.IO 的 emit/房间跨进程经 Redis 广播；
+    - local / hub / forward 一律不挂（= 改造前单进程行为）；
+    - redis 包缺失或初始化失败 → warning + 不挂（绝不因缺依赖而崩，实时降级不停摆）。
+    """
+    from . import bus
+
+    if bus.resolve_mode() != bus.MODE_REDIS:
+        return None
+    url = bus.redis_url()
+    try:
+        from socketio import AsyncRedisManager
+
+        manager = AsyncRedisManager(url)
+        logger.info("实时总线：Socket.IO 已启用 AsyncRedisManager（%s）", url)
+        return manager
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "实时总线：AsyncRedisManager 初始化失败 → 退回单进程 socket 管理（不崩）",
+            exc_info=True,
+        )
+        return None
+
+
+def _create_sio() -> socketio.AsyncServer:
+    kwargs = {
+        "async_mode": "asgi",
+        "cors_allowed_origins": _socketio_cors_origins(),
+        "ping_interval": 25,
+        "ping_timeout": 20,
+    }
+    manager = _build_client_manager()
+    if manager is not None:
+        kwargs["client_manager"] = manager
+    return socketio.AsyncServer(**kwargs)
+
+
+sio = _create_sio()
 
 
 # ==================== JWT 校验（连接握手） ====================
@@ -157,6 +194,16 @@ async def connect(sid, environ, auth):
     cid = getattr(user, "competition_id", None)
     if cid:
         await sio.enter_room(sid, f"comp-{cid}")
+
+    # 握手即下发当前全局门禁状态（强制暂停 / 回退中 / 数据版本）：刚上线或断线重连的
+    # 客户端即使错过了 system:paused 广播，也能立刻进入遮罩态，不会在暂停期间继续操作。
+    try:
+        from apps.snapshots.gate import load_state
+
+        state = await sync_to_async(load_state, thread_sensitive=True)(True)
+        await sio.emit("system:state", state, room=sid)
+    except Exception:  # noqa: BLE001
+        logger.debug("下发门禁状态失败 sid=%s", sid, exc_info=True)
 
     logger.info("socket.io 已连接：sid=%s user=%s", sid, user.username)
     return True

@@ -19,6 +19,8 @@
 """
 from __future__ import annotations
 
+import threading
+from contextlib import contextmanager
 from decimal import Decimal, InvalidOperation
 
 from django.db import connection as default_connection
@@ -29,6 +31,30 @@ from apps.common.exceptions import BusinessError
 # SQLite 以 double 存储十进制，Django 读回时按 prec=15 还原：
 # 有效数字超过 15 位即无法原样往返。
 SQLITE_EXACT_SIGNIFICANT_DIGITS = 15
+
+
+# ==================== 守卫开关（供历史数据原样回写使用） ====================
+# 场景：快照回退要把「从库里读出来的原值」原样写回。SQLite 读回的大数 Decimal 会带
+# 上 REAL 展开后的尾数（有效数字 > 15），若仍走本守卫，回退会因「写进去会被截断」
+# 被自己拦下 —— 而该值本来就是这样存的，写回并不会造成新的精度损失。
+# 因此回退引擎在写库期间用 suspend_exact_decimal_guard() 临时放行；
+# 常规业务写路径不受任何影响（默认 false）。
+_guard_state = threading.local()
+
+
+def _guard_suspended() -> bool:
+    return bool(getattr(_guard_state, "suspended", False))
+
+
+@contextmanager
+def suspend_exact_decimal_guard():
+    """临时关闭 SQLite 十进制精度守卫（仅快照回退等「原值回写」场景使用）。"""
+    prev = _guard_suspended()
+    _guard_state.suspended = True
+    try:
+        yield
+    finally:
+        _guard_state.suspended = prev
 
 
 def significant_digits(value: Decimal) -> int:
@@ -42,6 +68,8 @@ def significant_digits(value: Decimal) -> int:
 
 def assert_sqlite_exact(value: Decimal, label: str, connection=None) -> None:
     """SQLite 上拒绝无法精确往返的 Decimal（其余后端直接放行）。"""
+    if _guard_suspended():
+        return
     conn = connection if connection is not None else default_connection
     if getattr(conn, "vendor", None) != "sqlite":
         return

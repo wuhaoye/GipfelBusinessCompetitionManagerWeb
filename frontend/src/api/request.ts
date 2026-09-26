@@ -2,6 +2,7 @@ import axios, { AxiosInstance, AxiosRequestConfig } from "axios";
 import { ElMessage } from "element-plus";
 import { getApiBaseUrl, versionBlocked } from "@/config";
 import { getAccountItem, removeAccountItem } from "@/utils/accountStorage";
+import { applyGateState, requestBlockReason, type GateState } from "@/system/gate";
 // 本地全量副本 → 响应形态（纯函数，独立成模块以便单测）：
 // 未显式传 pageSize 时返回本地全量，不再按 50 条静默截断（审计 A-01/V-04/W-05）。
 import { applyLocalPaging as reconstruct } from "./localPaging";
@@ -32,6 +33,16 @@ declare module "axios" {
     /** 为 false 时跳过列表响应降维：返回原始 {items,total,...} 分页对象而非裸数组
      *  （供需要 total/分页字段的调用方使用，如审计日志页）。缺省降维为裸数组。 */
     normalize?: boolean;
+    /** 绕过全局门禁（强制暂停 / 回退中）的客户端侧拦截。
+     *  仅门禁状态查询与「恢复运行」等管理端点需要，避免暂停期间连状态都读不到。 */
+    bypassGate?: boolean;
+    /** 条件请求（C3 自适应心跳等）：**仅对显式声明该字段的调用**放开 304 并保留响应元信息。
+     *  - 该调用的 validateStatus 追加「304 视为成功」，304 无响应体也不会被判失败；
+     *  - 成功分支返回 { status, headers, data }（而非既有的「只返回解包数据」），
+     *    调用方才能读到 ETag 并区分 304 / 200；
+     *  - 其余请求的拦截器行为（信封解包、失败弹错、401 踢出）完全不变；
+     *  - 需与 cache:false 搭配（条件请求走真实网络，不参与本地全量副本/memo 那一套）。 */
+    conditional?: boolean;
   }
 }
 
@@ -47,6 +58,20 @@ api.interceptors.request.use(
       return Promise.reject(
         new Error("客户端版本与服务端不一致，已禁用全部请求，请联系管理员获取最新版本"),
       );
+    }
+    // 全局门禁（快照强制暂停 / 回退中）：客户端侧先行拦截，不发无谓的网络请求。
+    // 服务端 middleware 同样会以 423 拒绝，这里只是第一道闸门（保证提示即时、无噪声）。
+    if (!config.bypassGate) {
+      const reason = requestBlockReason(config.method || "GET");
+      if (reason) return Promise.reject(new Error(reason));
+    }
+    // 条件请求（C3 心跳等）：**只对该调用**放开 304 —— 对条件请求而言「304 未变更」是成功结果，
+    // 而 axios 默认只把 2xx 视作成功、304 会被 reject 成错误（进而触发全局错误提示）。
+    // 这里逐调用覆写 validateStatus（保留调用方自带的判定），不影响任何其它请求。
+    if (config.conditional) {
+      const prevValidate = config.validateStatus;
+      config.validateStatus = (status: number) =>
+        status === 304 || (prevValidate ? prevValidate(status) : status >= 200 && status < 300);
     }
     const token = getAccountItem("token");
     if (token) {
@@ -101,8 +126,35 @@ export function isSessionRefreshing(): boolean {
   return _sessionRefreshing;
 }
 
+// 423（Locked）提示去抖：门禁期间可能有多个并发请求同时被拒，只提示一次。
+let _lastGateToastAt = 0;
+function _toastGateBlocked(message: string): void {
+  const now = Date.now();
+  if (now - _lastGateToastAt < 4000) return;
+  _lastGateToastAt = now;
+  ElMessage.warning(message);
+}
+
 api.interceptors.response.use(
   (response) => {
+    // 条件请求（C3 心跳等）：只对该调用返回 { status, headers, data }，
+    // 让调用方能区分「304 未变更」与「200 有新内容」并读取 ETag。
+    // 304 没有响应体，直接返回 data=null，绝不能进入信封判定（否则会被当成空响应/错误）。
+    if (response.config?.conditional) {
+      if (response.status === 304) {
+        return { status: 304, headers: response.headers ?? {}, data: null } as any;
+      }
+      const conditionalDecision = interpretResponse(response.data);
+      if (conditionalDecision.kind === "error") {
+        if (!response.config?.silent) ElMessage.error(conditionalDecision.message);
+        return Promise.reject(new Error(conditionalDecision.message));
+      }
+      return {
+        status: response.status,
+        headers: response.headers ?? {},
+        data: conditionalDecision.value,
+      } as any;
+    }
     // 响应体归类（纯函数，见 ./envelope.ts）：二进制下载原样返回、带 code 的按信封语义、
     // 其余非信封 2xx 也原样返回 —— 改前直接读 res.code 判定，导致 blob 下载与
     // 非信封响应被一律判为失败（审计 F-01）。
@@ -124,6 +176,15 @@ api.interceptors.response.use(
     if (error.headers) delete (error.headers as Record<string, unknown>).Authorization;
     // 后台静默同步请求（缓存增量轮询 / 离线降级）失败不弹提示，由缓存层自行降级。
     if (error.config?.silent && error.response?.status !== 401) {
+      return Promise.reject(error);
+    }
+    // 全局门禁（HTTP 423 Locked）：系统被强制暂停 / 正在回退。
+    // 同步服务端下发的门禁快照（含 dataVersion），让遮罩与请求拦截立即生效；
+    // 提示去抖，避免并发请求刷屏。
+    if (error.response?.status === 423) {
+      const gate = error.response.data?.gate as GateState | undefined;
+      if (gate) applyGateState(gate);
+      if (!error.config?.silent) _toastGateBlocked(getErrorMessage(error));
       return Promise.reject(error);
     }
     if (error.response?.status === 401) {
@@ -532,9 +593,36 @@ function companyFieldKey(companyId: string | number | undefined): string {
   return `companyField|companyId=${companyId ?? ""}`;
 }
 
+/**
+ * 产业字段元素 → 本地副本条目：补一个 `id` 别名。
+ *
+ * 后端 `/company-fields/{cid}` 与批量端点的 fields 元素**没有 `id` 键**，其 id 语义是
+ * `industryFieldId`（见 backend/apps/company_fields/views.py 的契约注释与设计说明 §4.2），
+ * `existingIds` / `deletedIds` 里同样是 industryFieldId。而：
+ *   - `patchFullItems` 按 `it.id` 建 Map，元素没有 id 时「变更项不被合并」且
+ *     existingIds 非空时会把本地副本**整份过滤掉**（重连对账后公司产业字段变空）；
+ *   - 既有消费方两种口径都有：`StockManageView` 用 `fv.id`、`CompanyDetailView` 用 `f.id`、
+ *     `useDashboardFields` 用 `f.industryFieldId`。
+ * 故在此统一补 `id = industryFieldId`（已有 id 时原样保留），三处消费方与增量合并同时正确。
+ */
+export function normalizeCompanyFieldItems(fields: unknown[]): unknown[] {
+  const out: unknown[] = [];
+  for (const f of fields || []) {
+    if (!f || typeof f !== "object") {
+      out.push(f);
+      continue;
+    }
+    const rec = f as Record<string, unknown>;
+    const iid = rec.industryFieldId ?? rec.industry_field_id;
+    if (rec.id == null && typeof iid === "number") out.push({ ...rec, id: iid });
+    else out.push(rec);
+  }
+  return out;
+}
+
 async function storeCompanyFieldsAndReturn(ck: string, v: unknown): Promise<unknown> {
   const vRec = v as Record<string, unknown> | null;
-  const fields: unknown[] = (vRec?.fields as unknown[]) || [];
+  const fields: unknown[] = normalizeCompanyFieldItems((vRec?.fields as unknown[]) || []);
   await setFull(ck, { items: fields, shape: "array" });
   const base = (vRec?.serverTime as string | undefined) || maxUpdatedAtOf(fields);
   if (base) await setBaseline(ck, base);
@@ -565,7 +653,13 @@ async function syncCompanyFields(url: string, config: AxiosRequestConfig, compan
         // 向后兼容：如果服务器返回existingIds（旧协议），则使用existingIds
         const deletedIds = v.deletedIds as number[] | undefined;
         const existingIds = v.existingIds as number[] | undefined;
-        const merged = await patchFullItems(ck, (v.fields as unknown[]) || [], existingIds, deletedIds);
+        // 元素无 id 键（id 语义 = industryFieldId）→ 先归一，否则 patchFullItems 会把本地副本清空
+        const merged = await patchFullItems(
+          ck,
+          normalizeCompanyFieldItems((v.fields as unknown[]) || []),
+          existingIds,
+          deletedIds,
+        );
         await setBaseline(ck, (v.serverTime as string) || baseline);
         await setFullSyncAt(ck, Date.now());
         const firstMerged = merged[0] as Record<string, unknown> | undefined;
@@ -744,11 +838,274 @@ const RESOURCE_TO_SEG: Record<string, string> = Object.fromEntries(
   Object.entries(SEG_TO_RESOURCE).map(([seg, res]) => [res, seg]),
 );
 
+// ===================== C3：重连对账的并发上限 / 指数退避 / 抖动 / 批量端点 =====================
+// 背景（简报 C3.2）：断线重连会对「本地已加载的每个集合 + 每张复合地图 + 每个访问过的公司」
+// 一次性扇出（100 客户端 × 10 集合 ≈ 上千请求在同一毫秒涌向后端）。这里做三件事：
+//   1) 并发上限：同一时刻最多 RECONCILE_CONCURRENCY（默认 2）个请求在途；
+//   2) 启动抖动 + 失败重试的指数退避：避免全体客户端同一毫秒一起对账；
+//   3) 产业字段改走批量端点 GET /company-fields?companyIds=…（设计说明 §4.2），
+//      批量不可用时回落逐个 /company-fields/{cid}，对账不丢。
+// 语义不变：单个集合失败仍静默（不弹提示、不中断其余集合），完成后照旧派发 sync:reconciled。
+
+/** 重连对账的在途请求并发上限（具名常量，可调大以换取更快对账）。
+ *  现场如需调整：改这里并重新 `npm run build`（不做构建期可配置，避免引入构建变量复杂度）；
+ *  建议按简报 C3.4 的压测结果（断网恢复后的请求数与耗时）再定 2 还是 4。 */
+export const RECONCILE_CONCURRENCY = 2;
+/** 单个对账任务的最大尝试次数（首次 + 2 次退避重试）；耗尽后静默放弃（与改造前一致）。 */
+export const RECONCILE_MAX_ATTEMPTS = 3;
+/** 退避基数（ms）：第 n 次重试等待 ≈ base × 2^n，再乘抖动系数。 */
+export const RECONCILE_RETRY_BASE_MS = 500;
+/** 退避上限（ms）：指数增长到此封顶。 */
+export const RECONCILE_RETRY_MAX_MS = 8000;
+/** 对账开始前的全场抖动窗口（ms）：每个客户端随机等待 [0, 该值)，避免同一毫秒一起重连。 */
+export const RECONCILE_START_JITTER_MS = 1000;
+/** 批量端点单次请求的公司数上限（与设计说明 §4.2 建议值 50 对齐；超出则分批）。 */
+export const COMPANY_FIELDS_BATCH_LIMIT = 50;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** 抖动系数：0.5x ~ 1.5x（rand ∈ [0,1]）。 */
+function jitterFactor(rand: () => number): number {
+  const r = rand();
+  const v = Number.isFinite(r) ? r : 0.5;
+  return 0.5 + Math.min(Math.max(v, 0), 1);
+}
+
+/** 指数退避 + 抖动（纯函数，便于单测）：
+ *  第 attempt 次重试等待 = min(RECONCILE_RETRY_BASE_MS × 2^attempt, RECONCILE_RETRY_MAX_MS) × [0.5, 1.5)。 */
+export function reconcileRetryDelayMs(attempt: number, rand: () => number = Math.random): number {
+  const n = Number.isFinite(attempt) ? Math.max(0, Math.floor(attempt)) : 0;
+  const capped = Math.min(RECONCILE_RETRY_BASE_MS * 2 ** n, RECONCILE_RETRY_MAX_MS);
+  return Math.round(capped * jitterFactor(rand));
+}
+
+/** 对账启动抖动（纯函数，便于单测）：[0, RECONCILE_START_JITTER_MS)。 */
+export function reconcileStartDelayMs(rand: () => number = Math.random): number {
+  const r = rand();
+  const v = Number.isFinite(r) ? r : 0.5;
+  return Math.round(Math.min(Math.max(v, 0), 1) * RECONCILE_START_JITTER_MS);
+}
+
+/** 具名并发上限执行器：同一时刻最多 limit 个任务在途，逐个从队首取任务。
+ *  单个任务失败不影响其余（对账整体静默）。 */
+export async function runWithConcurrency<T>(
+  tasks: Array<() => Promise<T>>,
+  limit: number = RECONCILE_CONCURRENCY,
+): Promise<void> {
+  const queue = Array.isArray(tasks) ? tasks.slice() : [];
+  if (!queue.length) return;
+  const size = Math.max(1, Math.min(Math.floor(limit) || RECONCILE_CONCURRENCY, queue.length));
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      const task = queue.shift();
+      if (!task) return;
+      try {
+        await task();
+      } catch {
+        /* 单个任务失败不影响其余（对账整体静默） */
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: size }, () => worker()));
+}
+
+/** 是否值得退避重试：5xx / 408 / 429 / 无响应的网络错误可重试；
+ *  确定性失败（404 端点不存在、403 无权限、401 失效、400 参数错）不重试，
+ *  避免在「批量端点尚未部署」这类情况下放大请求量与日志。 */
+function isRetriableReconcileError(e: unknown): boolean {
+  const status = (e as { response?: { status?: number } } | null)?.response?.status;
+  if (typeof status === "number") return status >= 500 || status === 408 || status === 429;
+  return true;
+}
+
+/** 带指数退避 + 抖动的重试：不可重试或尝试耗尽 → 返回 null（调用方静默）。 */
+export async function reconcileWithRetry<T>(task: () => Promise<T>): Promise<T | null> {
+  for (let attempt = 0; attempt < RECONCILE_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      return await task();
+    } catch (e) {
+      if (attempt >= RECONCILE_MAX_ATTEMPTS - 1 || !isRetriableReconcileError(e)) return null;
+      await sleep(reconcileRetryDelayMs(attempt));
+    }
+  }
+  return null;
+}
+
+export interface CompanyFieldReconcileEntry {
+  /** 本地全量副本集合键，如 companyField|companyId=1 */
+  collectionKey: string;
+  companyId: number;
+  /** 该集合的本地基线（作为 updatedAfter 发出） */
+  baseline: string;
+}
+
+/** 把单公司 / 批量返回的增量对象合入本地副本并推进基线（与单点端点语义一致）。
+ *  只要带 fields 数组就合并：patchFullItems 仅在有非空 existingIds/deletedIds 时才做删除核对，
+ *  对「服务端误按全量返回」同样安全；放宽后也不会因后端把 incremental 标记只放在顶层而静默失效。 */
+async function applyCompanyFieldIncremental(
+  collectionKey: string,
+  baseline: string,
+  v: unknown,
+  fallbackServerTime?: string,
+): Promise<void> {
+  const rec = v as Record<string, unknown> | null;
+  if (!rec || typeof rec !== "object" || !Array.isArray(rec.fields)) return;
+  // 优先使用 deletedIds（新协议：客户端发送 previousIds，服务器返回 deletedIds）
+  // 向后兼容：如果服务器返回 existingIds（旧协议），则使用 existingIds
+  const deletedIds = rec.deletedIds as number[] | undefined;
+  const existingIds = rec.existingIds as number[] | undefined;
+  // 元素无 id 键（id 语义 = industryFieldId）→ 先归一并补 id 别名，与 existingIds/deletedIds 对齐
+  await patchFullItems(
+    collectionKey,
+    normalizeCompanyFieldItems((rec.fields as unknown[]) || []),
+    existingIds,
+    deletedIds,
+  );
+  await setBaseline(collectionKey, (rec.serverTime as string) || fallbackServerTime || baseline);
+}
+
+/** 单公司产业字段增量对账（旧路径；批量端点不可用时的回落，带退避重试且失败静默）。 */
+async function reconcileCompanyFieldOne(entry: CompanyFieldReconcileEntry): Promise<void> {
+  await reconcileWithRetry(async () => {
+    const v = await (api as any).get(`/company-fields/${entry.companyId}`, {
+      params: { updatedAfter: entry.baseline },
+      silent: true,
+    });
+    await applyCompanyFieldIncremental(entry.collectionKey, entry.baseline, v);
+  });
+}
+
+/** 批量端点增量对账：一次请求多公司（设计说明 §4.2）。
+ *  返回 true = 批量端点可用且已按公司合入；false = 需回落逐个端点
+ *  （旧后端 404 / 400 超限 / 网络失败 / 响应不含 companies），回落由调用方负责。 */
+async function reconcileCompanyFieldsBatch(
+  entries: CompanyFieldReconcileEntry[],
+  baseline: string,
+): Promise<boolean> {
+  try {
+    const v = await (api as any).get("/company-fields", {
+      params: { companyIds: entries.map((e) => e.companyId).join(","), updatedAfter: baseline },
+      silent: true,
+    });
+    const data = v as Record<string, unknown> | null;
+    const companies = data?.companies as Record<string, Record<string, unknown>> | undefined;
+    if (!companies || typeof companies !== "object") return false;
+    const fallbackServerTime = data?.serverTime as string | undefined;
+    for (const entry of entries) {
+      // 无权 / 不存在的公司进 missing，服务端不返回其数据（§4.2）→ 保持本地副本不动
+      const one = companies[String(entry.companyId)];
+      if (!one) continue;
+      await applyCompanyFieldIncremental(entry.collectionKey, baseline, one, fallbackServerTime);
+    }
+    return true;
+  } catch {
+    return false; // 批量失败 → 回落逐个端点，对账不丢（失败静默）
+  }
+}
+
+/**
+ * 产业字段对账（C3.3）：按基线分组，同一基线的多家公司合并为一次批量请求；
+ * 批量不可用则回落逐个 /company-fields/{cid}。
+ * 导出以便单测：Node 侧无 IndexedDB，真实 reconcileAllIncremental 无法在无 IndexedDB 环境枚举集合。
+ */
+export async function reconcileCompanyFields(entries: CompanyFieldReconcileEntry[]): Promise<void> {
+  const groups = new Map<string, CompanyFieldReconcileEntry[]>();
+  const seen = new Set<string>();
+  for (const e of entries || []) {
+    if (!e || e.companyId == null || !e.baseline) continue;
+    // 同一基线同一公司只对账一次：companyIds 去重后 >50 家会被后端 400（§4.2 上限）
+    const dedupeKey = `${e.baseline}|${e.companyId}`;
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+    const g = groups.get(e.baseline);
+    if (g) g.push(e);
+    else groups.set(e.baseline, [e]);
+  }
+  for (const [baseline, group] of groups) {
+    for (let i = 0; i < group.length; i += COMPANY_FIELDS_BATCH_LIMIT) {
+      const chunk = group.slice(i, i + COMPANY_FIELDS_BATCH_LIMIT);
+      // 单公司分组：批量端点无收益（还多一次「旧后端 404」探测），直接走单点端点。
+      if (chunk.length === 1) {
+        await reconcileCompanyFieldOne(chunk[0]);
+        continue;
+      }
+      const okBatch = await reconcileCompanyFieldsBatch(chunk, baseline);
+      if (!okBatch) {
+        for (const e of chunk) await reconcileCompanyFieldOne(e);
+      }
+    }
+  }
+}
+
+/** 单个普通集合的增量对账（带指数退避重试；失败静默）。 */
+async function reconcileCollectionIncremental(
+  c: { collectionKey: string; resource: string; rest: string },
+  seg: string,
+): Promise<void> {
+  await reconcileWithRetry(async () => {
+    const baseline = await getBaseline(c.collectionKey);
+    if (!baseline) return;
+    const params: Record<string, unknown> = {};
+    if (c.rest) {
+      for (const kv of c.rest.split("&")) {
+        const eq = kv.indexOf("=");
+        if (eq > 0) params[kv.slice(0, eq)] = kv.slice(eq + 1);
+      }
+    }
+    const vRaw = await (api as any).get(`/${seg}`, {
+      params: { ...params, updatedAfter: baseline, requireExistingIds: "true" },
+      silent: true,
+    });
+    const v = vRaw as Record<string, unknown> | null;
+    if (v && v.incremental) {
+      // 优先使用deletedIds（新协议：客户端发送previousIds，服务器返回deletedIds）
+      // 向后兼容：如果服务器返回existingIds（旧协议），则使用existingIds
+      const deletedIds = v.deletedIds as number[] | undefined;
+      const existingIds = v.existingIds as number[] | undefined;
+      await patchFullItems(c.collectionKey, (v.items as unknown[]) || [], existingIds, deletedIds);
+      await setBaseline(c.collectionKey, (v.serverTime as string) || baseline);
+    }
+  });
+}
+
+/** 单张复合地图的增量对账（带指数退避重试；失败静默）。 */
+async function reconcileMapIncremental(m: {
+  syncKey: string;
+  competitionId: string | number;
+}): Promise<void> {
+  await reconcileWithRetry(async () => {
+    const baseline = await getBaseline(m.syncKey);
+    if (!baseline) return;
+    const vRaw = await (api as any).get("/maps/full", {
+      params: { competitionId: m.competitionId, updatedAfter: baseline, requireExistingIds: "true" },
+      silent: true,
+    });
+    const v = vRaw as Record<string, unknown> | null;
+    if (v && v.incremental) {
+      const existingIds = v.existingIds as Record<string, unknown> | undefined;
+      const deletedIds = v.deletedIds as Record<string, unknown> | undefined;
+      const subs = MAP_SUB_RESOURCES.map((r) => mapSubKey(r, m.competitionId));
+      // 优先使用deletedIds（新协议：客户端发送previousIds，服务器返回deletedIds）
+      // 向后兼容：如果服务器返回existingIds（旧协议），则使用existingIds
+      await patchFullItems(subs[0], (v.nodes as unknown[]) || [], existingIds?.nodes as number[] | undefined, deletedIds?.nodes as number[] | undefined);
+      await patchFullItems(subs[1], (v.edges as unknown[]) || [], existingIds?.edges as number[] | undefined, deletedIds?.edges as number[] | undefined);
+      await patchFullItems(subs[2], (v.nodeTypes as unknown[]) || [], existingIds?.nodeTypes as number[] | undefined, deletedIds?.nodeTypes as number[] | undefined);
+      await patchFullItems(subs[3], (v.pathTypes as unknown[]) || [], existingIds?.pathTypes as number[] | undefined, deletedIds?.pathTypes as number[] | undefined);
+      await setBaseline(m.syncKey, (v.serverTime as string) || baseline);
+    }
+  });
+}
+
 /**
  * 断线重连后主动对账：遍历本地已加载的全量副本，逐个发一次增量请求（带各自基线），
- * 用服务端回传的 existingIds 清理掉「断线 / 实时事件丢失期间」被删除的条目，
+ * 用服务端回传的 existingIds/deletedIds 清理掉「断线 / 实时事件丢失期间」被删除的条目，
  * 无需等用户手动刷新或 5 分钟强制全量周期。仅对已有基线的集合生效（首次进入尚无
  * 副本的集合本就无脏数据，跳过）。
+ *
+ * C3 改造：扇出不再是无上限的 Promise.all，而是「启动抖动 + 并发上限 2 + 指数退避重试」；
+ * 产业字段按基线分组走批量端点。事件派发（sync:reconciled）与失败静默语义保持不变。
  */
 export async function reconcileAllIncremental(): Promise<void> {
   // 未登录（无 token）时不发起对账：避免匿名客户端轰炸服务器、产生大量 401 噪声与审计日志。
@@ -760,94 +1117,44 @@ export async function reconcileAllIncremental(): Promise<void> {
   try {
     [cols, maps] = await Promise.all([listFullCollections(), listMapSyncKeys()]);
 
-    // 普通集合：逐集合发一次增量请求
-    await Promise.all(
-      cols.map(async (c) => {
-        // 公司产业字段：companyId 是路径参数，不能用通用的 `/<seg>` 拼法，单独处理
-        if (c.resource === "companyField") {
-          const m = c.rest.match(/companyId=(\d+)/);
-          const cid = m ? Number(m[1]) : null;
-          if (cid == null) return;
-          const base = await getBaseline(c.collectionKey);
-          if (!base) return;
-          try {
-            const vRaw = await (api as any).get(`/company-fields/${cid}`, {
-              params: { updatedAfter: base },
-              silent: true,
-            });
-            const v = vRaw as Record<string, unknown> | null;
-            if (v && v.incremental) {
-              // 优先使用deletedIds（新协议：客户端发送previousIds，服务器返回deletedIds）
-              // 向后兼容：如果服务器返回existingIds（旧协议），则使用existingIds
-              const deletedIds = v.deletedIds as number[] | undefined;
-              const existingIds = v.existingIds as number[] | undefined;
-              await patchFullItems(c.collectionKey, (v.fields as unknown[]) || [], existingIds, deletedIds);
-              await setBaseline(c.collectionKey, (v.serverTime as string) || base);
-            }
-          } catch {
-            /* 单个集合失败不影响其余 */
-          }
-          return;
-        }
-        const seg = RESOURCE_TO_SEG[c.resource];
-        if (!seg || seg === "maps") return; // 复合地图单独处理
-        const baseline = await getBaseline(c.collectionKey);
-        if (!baseline) return;
-        const params: Record<string, unknown> = {};
-        if (c.rest) {
-          for (const kv of c.rest.split("&")) {
-            const eq = kv.indexOf("=");
-            if (eq > 0) params[kv.slice(0, eq)] = kv.slice(eq + 1);
-          }
-        }
-        try {
-          const vRaw = await (api as any).get(`/${seg}`, {
-            params: { ...params, updatedAfter: baseline, requireExistingIds: "true" },
-            silent: true,
-          });
-          const v = vRaw as Record<string, unknown> | null;
-          if (v && v.incremental) {
-            // 优先使用deletedIds（新协议：客户端发送previousIds，服务器返回deletedIds）
-            // 向后兼容：如果服务器返回existingIds（旧协议），则使用existingIds
-            const deletedIds = v.deletedIds as number[] | undefined;
-            const existingIds = v.existingIds as number[] | undefined;
-            await patchFullItems(c.collectionKey, (v.items as unknown[]) || [], existingIds, deletedIds);
-            await setBaseline(c.collectionKey, (v.serverTime as string) || baseline);
-          }
-        } catch {
-          /* 单个集合失败不影响其余 */
-        }
-      }),
-    );
+    const tasks: Array<() => Promise<unknown>> = [];
+    const cfCols: { collectionKey: string; companyId: number }[] = [];
+    const cfEntries: CompanyFieldReconcileEntry[] = [];
+
+    for (const c of cols) {
+      // 公司产业字段：companyId 是路径参数，不能走通用 `/<seg>` 拼法；
+      // 这里只收集「集合键 + 公司 id」，基线稍后并发读出（本地 IndexedDB 读，不发网络），
+      // 再交给批量对账（按基线分组，一次请求多公司）。
+      if (c.resource === "companyField") {
+        const m = c.rest.match(/companyId=(\d+)/);
+        const cid = m ? Number(m[1]) : null;
+        if (cid == null) continue;
+        cfCols.push({ collectionKey: c.collectionKey, companyId: cid });
+        continue;
+      }
+      const seg = RESOURCE_TO_SEG[c.resource];
+      if (!seg || seg === "maps") continue; // 复合地图单独处理
+      tasks.push(() => reconcileCollectionIncremental(c, seg));
+    }
 
     // 复合地图：对每个已加载比赛发一次 /maps/full 增量请求
-    await Promise.all(
-      maps.map(async (m) => {
-        const baseline = await getBaseline(m.syncKey);
-        if (!baseline) return;
-        try {
-          const vRaw = await (api as any).get("/maps/full", {
-            params: { competitionId: m.competitionId, updatedAfter: baseline, requireExistingIds: "true" },
-            silent: true,
-          });
-          const v = vRaw as Record<string, unknown> | null;
-          if (v && v.incremental) {
-            const existingIds = v.existingIds as Record<string, unknown> | undefined;
-            const deletedIds = v.deletedIds as Record<string, unknown> | undefined;
-            const subs = MAP_SUB_RESOURCES.map((r) => mapSubKey(r, m.competitionId));
-            // 优先使用deletedIds（新协议：客户端发送previousIds，服务器返回deletedIds）
-            // 向后兼容：如果服务器返回existingIds（旧协议），则使用existingIds
-            await patchFullItems(subs[0], (v.nodes as unknown[]) || [], existingIds?.nodes as number[] | undefined, deletedIds?.nodes as number[] | undefined);
-            await patchFullItems(subs[1], (v.edges as unknown[]) || [], existingIds?.edges as number[] | undefined, deletedIds?.edges as number[] | undefined);
-            await patchFullItems(subs[2], (v.nodeTypes as unknown[]) || [], existingIds?.nodeTypes as number[] | undefined, deletedIds?.nodeTypes as number[] | undefined);
-            await patchFullItems(subs[3], (v.pathTypes as unknown[]) || [], existingIds?.pathTypes as number[] | undefined, deletedIds?.pathTypes as number[] | undefined);
-            await setBaseline(m.syncKey, (v.serverTime as string) || baseline);
-          }
-        } catch {
-          /* 忽略 */
-        }
-      }),
-    );
+    for (const m of maps) tasks.push(() => reconcileMapIncremental(m));
+
+    // 产业字段：并发读基线 → 一个任务内完成「批量优先 + 失败回落单点」（不占用额外并发额度）
+    const cfBaselines = await Promise.all(cfCols.map((x) => getBaseline(x.collectionKey)));
+    cfCols.forEach((x, i) => {
+      const base = cfBaselines[i];
+      if (base) cfEntries.push({ collectionKey: x.collectionKey, companyId: x.companyId, baseline: base });
+    });
+    if (cfEntries.length) tasks.push(() => reconcileCompanyFields(cfEntries));
+
+    if (tasks.length) {
+      // 全场抖动：Wi-Fi 恢复后各客户端在同一毫秒一起对账是尖峰的根因（简报 C3.2），
+      // 先随机等待 [0, RECONCILE_START_JITTER_MS) 再扇出。
+      await sleep(reconcileStartDelayMs());
+      // 并发上限（默认 2）+ 每任务指数退避重试：把上千请求摊平，失败仍静默。
+      await runWithConcurrency(tasks);
+    }
   } catch {
     /* 忽略：对账失败不阻断主流程 */
   } finally {

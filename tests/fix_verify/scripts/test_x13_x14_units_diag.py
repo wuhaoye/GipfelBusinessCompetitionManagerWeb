@@ -14,6 +14,11 @@
   ③ 端口硬编码 8120（与 nginx/ufw 的实际端口可能不一致）；
   ④ `sudo -n` 失败时静默无输出。
 
+★ C1-a 追加（2026-09）：新增了第三个 unit `deploy/gipfel-wsgi.service`（gunicorn WSGI）。
+  X-13 的结论（运行/日志目录不共用、模式 0750、UMask、最小可写路径、Environment 顺序）
+  必须**同样适用**于它 —— 新 unit 最容易成为"加固漏网"。故本用例增加对它的断言，
+  并把 nginx 断言扩成"分离上游"（/api/→8002、/socket.io/→8000；这两处端口/上游变更属有意）。
+
 本机没有可执行的 bash，故用**静态语义核对 + Python 等价行为复现**验证。
 
 用法（仓库根目录）：
@@ -27,6 +32,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
 GIPFEL_UNIT = REPO / "deploy" / "gipfel.service"
+WSGI_UNIT = REPO / "deploy" / "gipfel-wsgi.service"
 LV_UNIT = REPO / "deploy" / "logviewer.service"
 DIAG = REPO / "tests" / "gipfel-logviewer-diag.sh"
 
@@ -103,11 +109,64 @@ class X13UnitHardeningTests(unittest.TestCase):
                              f"{name} 不应写死主服务的日志目录")
 
     def test_nginx_does_not_use_the_unix_socket(self):
-        """收紧运行目录权限的前提：nginx 走的是 127.0.0.1:8000（不是 unix socket）。"""
+        """收紧运行目录权限的前提：nginx 走的是 TCP 回环（不是 unix socket）。
+
+        C1-a：`/api/` 改走 gunicorn(127.0.0.1:8002)，`/socket.io/` 走 daphne(127.0.0.1:8000)。
+        两个字面量都必须在（8000 仍被 socket.io 上游使用），且都不依赖 Unix socket。
+        """
         nginx = (REPO / "deploy" / "nginx-gipfel.conf").read_text(encoding="utf-8")
         self.assertNotIn("gipfel.sock", nginx, "nginx 若依赖 unix socket，收权会打断它")
         self.assertIn("127.0.0.1:8000", nginx)
         self.assertIn("127.0.0.1:8121", nginx)
+        # C1-a 追加：双上游必须各就各位，否则"收权前提"在拆分后就不成立了
+        self.assertRegex(
+            nginx, r"upstream gipfel_django \{[\s\S]*?server 127\.0\.0\.1:8002",
+            "gipfel_django 必须指向 WSGI(8002)（有意变更：C1-a 之前是 8000）",
+        )
+        self.assertRegex(
+            nginx, r"upstream gipfel_socketio \{[\s\S]*?server 127\.0\.0\.1:8000",
+            "gipfel_socketio 必须指向 daphne(8000)",
+        )
+
+    # ---- C1-a 追加：新 unit 必须继承 X-13 的全部加固结论 ----
+    def test_wsgi_unit_directories_are_tightened_and_private(self):
+        wsgi = _directives(WSGI_UNIT.read_text(encoding="utf-8"))
+        self.assertEqual(wsgi.get("RuntimeDirectoryMode"), "0750")
+        self.assertEqual(wsgi.get("LogsDirectoryMode"), "0750")
+        self.assertEqual(wsgi.get("UMask"), "0027")
+        self.assertEqual(wsgi.get("RuntimeDirectory"), "gipfel-wsgi")
+        self.assertEqual(wsgi.get("LogsDirectory"), "gipfel-wsgi")
+        # 不得与其它两个 unit 共用（共用会让 restart 互相清理目录）
+        for other in (_directives(GIPFEL_UNIT.read_text(encoding="utf-8")),
+                      _directives(LV_UNIT.read_text(encoding="utf-8"))):
+            self.assertNotEqual(wsgi.get("RuntimeDirectory"), other.get("RuntimeDirectory"))
+            self.assertNotEqual(wsgi.get("LogsDirectory"), other.get("LogsDirectory"))
+
+    def test_wsgi_unit_keeps_sandbox_and_write_paths(self):
+        text = WSGI_UNIT.read_text(encoding="utf-8")
+        code = "\n".join(
+            ln for ln in text.splitlines() if not ln.lstrip().startswith(("#", ";"))
+        )
+        for must in ("NoNewPrivileges=true", "ProtectSystem=full", "ProtectHome=true",
+                     "CapabilityBoundingSet=", "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
+                     "${LOGS_DIRECTORY}"):
+            self.assertIn(must, code, f"gipfel-wsgi.service 缺少加固项 {must}")
+        rwp = _directives(text).get("ReadWritePaths", "")
+        for must in ("backend/uploads", "backend/logs", "backend/snapshots", "db.sqlite3",
+                     "/run/gipfel-wsgi", "/var/log/gipfel-wsgi"):
+            self.assertIn(must, rwp, f"gipfel-wsgi.service 的 ReadWritePaths 缺少 {must}：{rwp}")
+
+    def test_all_units_declare_defaults_before_environment_file(self):
+        """systemd 中 EnvironmentFile 优先级更高；默认值必须排在它之前（顺序即文档）。"""
+        for path in (GIPFEL_UNIT, WSGI_UNIT, LV_UNIT):
+            lines = [
+                ln for ln in path.read_text(encoding="utf-8").splitlines()
+                if not ln.lstrip().startswith("#")
+            ]
+            env = [i for i, ln in enumerate(lines) if ln.strip().startswith("Environment=")]
+            env_file = [i for i, ln in enumerate(lines) if ln.strip().startswith("EnvironmentFile=")]
+            self.assertTrue(env and env_file, f"{path.name} 缺少 Environment=/EnvironmentFile=")
+            self.assertLess(max(env), min(env_file), f"{path.name} 的 Environment 顺序不对")
 
 
 class X14DiagScriptTests(unittest.TestCase):

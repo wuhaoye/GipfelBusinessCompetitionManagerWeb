@@ -527,6 +527,226 @@ export const widgetPackagesApi = {
   remove: (id: number) => api.delete(`/widget-packages/${id}`),
 };
 
+// ===================== 快照与回退 =====================
+export interface SnapshotSummary {
+  id: number;
+  label: string;
+  note: string;
+  kind: "manual" | "auto" | "pre-restore" | "system";
+  status: "building" | "ready" | "failed" | "restoring" | "restored";
+  scope: "competition" | "system";
+  competitionId: number | null;
+  competitionName: string;
+  scopeLabel: string;
+  tableCount: number;
+  rowCount: number;
+  byteSize: number;
+  includeFiles: boolean;
+  fileCount: number;
+  fileByteSize: number;
+  dataVersion: number;
+  serverSeq: number;
+  appVersion: string;
+  createdById: number | null;
+  createdByName: string;
+  createdAt: string | null;
+  durationMs: number;
+  locked: boolean;
+  error: string;
+  restoreCount: number;
+  restoredAt: string | null;
+  lastRestoredByName: string;
+}
+
+export interface SnapshotTableEntry {
+  model: string;
+  modelName: string;
+  table: string;
+  resource: string;
+  policy: "full" | "upsert" | "record";
+  rows: number;
+  bytes: number;
+  sha256: string;
+  file: string;
+}
+
+export interface SnapshotDetail extends SnapshotSummary {
+  tables: SnapshotTableEntry[];
+  manifest: Record<string, unknown> | null;
+  storagePath?: string;
+}
+
+export interface SnapshotDiffEntry {
+  model: string;
+  modelName?: string;
+  table: string;
+  policy: "full" | "upsert" | "record" | "skipped";
+  scope?: string;
+  snapshotRows: number;
+  currentRows: number | null;
+  deleteRows: number;
+  insertRows: number;
+  note: string;
+}
+
+export interface SnapshotDiff {
+  snapshotId: number;
+  scope: string;
+  competitionId: number | null;
+  tables: SnapshotDiffEntry[];
+  totals: {
+    deleteRows: number;
+    insertRows: number;
+    affectedTables: number;
+    skippedTables: number;
+  };
+}
+
+export interface GatePayload {
+  mode: "RUNNING" | "PAUSED" | "RESTORING";
+  reason: string;
+  message: string;
+  operatorId: number | null;
+  operatorName: string;
+  since: string | null;
+  ttlSeconds: number;
+  expiresAt: string | null;
+  activeSnapshotId: number | null;
+  progress: string;
+  dataVersion: number;
+  updatedAt?: string | null;
+}
+
+export interface SnapshotRestoreResult {
+  snapshotId: number;
+  label: string;
+  scope: string;
+  competitionId: number | null;
+  deletedRows: number;
+  insertedRows: number;
+  durationMs: number;
+  dataVersion: number;
+  tables: number;
+  skippedTables: number;
+  verified: boolean;
+  safetySnapshotId: number | null;
+  files?: { files?: number; bytes?: number; problems?: string[] };
+}
+
+export interface SnapshotPolicyPayload {
+  autoEnabled: boolean;
+  autoIntervalMinutes: number;
+  autoScope: "system" | "competition";
+  keepLast: number;
+  keepDays: number;
+  autoIncludeFiles: boolean;
+  lastAutoAt: string | null;
+}
+
+/**
+ * 快照系统接口。
+ * 门禁相关（status / gate / pause / resume）在系统被强制暂停时仍需可用，
+ * 故统一带 bypassGate（服务端对这些路径同样放行）。
+ */
+export const snapshotsApi = {
+  /** 概览：门禁 + 策略 + 数量 + 占用 */
+  status: () => api.get("/snapshots/status", { cache: false, bypassGate: true }),
+  /** 当前全局门禁状态 */
+  gate: () => api.get<GatePayload>("/snapshots/gate", { cache: false, bypassGate: true }),
+  /** 强制暂停（冻结所有人写入） */
+  pause: (data: { reason?: string; message?: string; ttlSeconds?: number }) =>
+    api.post<GatePayload>("/snapshots/gate/pause", data, { cache: false, bypassGate: true }),
+  /** 恢复运行 */
+  resume: (reason?: string) =>
+    api.post<GatePayload>("/snapshots/gate/resume", { reason }, { cache: false, bypassGate: true }),
+  /** 策略读取 / 保存 */
+  policy: {
+    get: () => api.get<SnapshotPolicyPayload>("/snapshots/policy", { cache: false, bypassGate: true }),
+    save: (data: Partial<SnapshotPolicyPayload>) =>
+      api.put<SnapshotPolicyPayload>("/snapshots/policy", data, { cache: false, bypassGate: true }),
+  },
+  /** 按保留策略清理（dryRun 预览） */
+  cleanup: (data: { dryRun?: boolean; keepLast?: number; keepDays?: number } = {}) =>
+    api.post("/snapshots/cleanup", data, { cache: false, bypassGate: true }),
+  /** 列表（分页） */
+  list: (query: {
+    page?: number;
+    pageSize?: number;
+    competitionId?: number | string;
+    kind?: string;
+    status?: string;
+    q?: string;
+  } = {}) => {
+    const params: Record<string, unknown> = { ...query };
+    for (const k of Object.keys(params)) {
+      if (params[k] === undefined || params[k] === null || params[k] === "") delete params[k];
+    }
+    return api.get("/snapshots", { params, cache: false, normalize: false, bypassGate: true });
+  },
+  /** 创建快照 */
+  create: (data: {
+    label?: string;
+    note?: string;
+    competitionId?: number | null;
+    scope?: "competition" | "system";
+    includeFiles?: boolean;
+    pauseFirst?: boolean;
+    ttlSeconds?: number;
+  }) => api.post<SnapshotSummary>("/snapshots", data, { cache: false, bypassGate: true }),
+  /** 详情（含逐表清单） */
+  get: (id: number) => api.get<SnapshotDetail>(`/snapshots/${id}`, { cache: false, bypassGate: true }),
+  /** 回退预览 */
+  diff: (id: number, opts: { includeUsers?: boolean; restoreGlobal?: boolean } = {}) =>
+    api.get<SnapshotDiff>(`/snapshots/${id}/diff`, {
+      params: opts,
+      cache: false,
+      bypassGate: true,
+    }),
+  /** 归档完整性校验 */
+  verify: (id: number) =>
+    api.get(`/snapshots/${id}/verify`, { cache: false, bypassGate: true }),
+  /** 锁定 / 解锁 */
+  lock: (id: number, locked: boolean) =>
+    api.post(`/snapshots/${id}/lock`, { locked }, { cache: false, bypassGate: true }),
+  /** 删除 */
+  remove: (id: number, force = false) =>
+    api.delete(`/snapshots/${id}`, {
+      params: force ? { force: true } : {},
+      cache: false,
+      bypassGate: true,
+    }),
+  /** 下载归档（tar.gz） */
+  download: (id: number) =>
+    api.get<Blob>(`/snapshots/${id}/download`, {
+      responseType: "blob",
+      cache: false,
+      bypassGate: true,
+      timeout: 120000,
+    }),
+  /**
+   * 回退（强制暂停全体 + 整库还原）。
+   * 注意：该请求本身耗时较长（含回退前安全快照与回退后校验），前端需给足超时。
+   */
+  restore: (
+    id: number,
+    data: {
+      confirmText: string;
+      reason?: string;
+      includeUsers?: boolean;
+      restoreGlobal?: boolean;
+      restoreFiles?: boolean;
+      skipSafetySnapshot?: boolean;
+      verify?: boolean;
+      ttlSeconds?: number;
+    },
+  ) =>
+    api.post<SnapshotRestoreResult>(`/snapshots/${id}/restore`, data, {
+      cache: false,
+      bypassGate: true,
+      timeout: 30 * 60 * 1000,
+    }),
+};
+
 // ===================== 比赛准备总览与归档 =====================
 export const preparationApi = {
   /** 准备清单：统计 + 体检提醒 + 明细（仅超管；默认取当前比赛） */

@@ -108,7 +108,7 @@ sudo unzip -d /opt /opt/fastgithub_linux-x64.zip
 | 上传 | `/opt/gipfel/backend/uploads/` |
 | 日志-Django | `/opt/gipfel/backend/logs/` + `/var/log/gipfel/` |
 | 日志-nginx | `/var/log/nginx/gipfel.{access,error}.log` |
-| systemd 服务 | `/etc/systemd/system/gipfel.service`、`/etc/systemd/system/gipfel-logviewer.service` |
+| systemd 服务 | `/etc/systemd/system/gipfel.service`（daphne/ASGI）、`gipfel-wsgi.service`（gunicorn/WSGI）、`gipfel-logviewer.service` |
 | nginx vhost | `/etc/nginx/sites-available/gipfel.conf`（sites-enabled 软链）。**有域名**时含 `log.<DOMAIN>` 日志查看器子域块；**无域名（纯 IP）**时自动换成 `:8120` 端口块（`server_name _`）——deploy 脚本按是否传 `--domain` 保留对应一块、删除另一块 |
 | 前端静态 | `/opt/gipfel/frontend-dist/`（由 nginx root 直接托管） |
 | 日志查看器静态 | `/opt/gipfel/backend/logviewer/staticfiles/`（由 nginx 日志查看器块 alias 托管：有域名是 `log.<DOMAIN>` 块，无域名是 `:8120` 块） |
@@ -116,13 +116,103 @@ sudo unzip -d /opt /opt/fastgithub_linux-x64.zip
 ### 验证
 
 ```bash
-systemctl status gipfel               # active (running)
+systemctl status gipfel               # active (running) ← daphne(ASGI) :8000，承载 /socket.io/
+systemctl status gipfel-wsgi          # active (running) ← gunicorn(WSGI) :8002，承载 /api/、/admin/
 systemctl status nginx                # active (running)
 systemctl status gipfel-logviewer     # active (running)  ← 日志查看器
-curl -sS http://127.0.0.1:8000/api/health  # ok:true
+
+# C1-a：两个后端进程要分别探活（只看一个会漏掉"另一个没起来"）
+curl -sS http://127.0.0.1:8002/api/health                      # 直连 WSGI(gunicorn) → ok:true
+curl -sS 'http://127.0.0.1:8000/socket.io/?EIO=4&transport=polling'   # 直连 daphne 的 Socket.IO 握手 → HTTP 200（响应体 0{"sid":...}）
+curl -sS http://127.0.0.1/api/health                           # 经 nginx（应落在 WSGI 上）→ ok:true
 curl -sS -I http://127.0.0.1/         # 200（nginx 托管 index.html）
 # 浏览器打开 https://comp.example.com
 ```
+
+> **端口速查**：`8000` = daphne(ASGI，只绑回环，只服务 `/socket.io/`)；`8002` = gunicorn(WSGI，只绑回环)；
+> `8121` = 日志查看器 daphne；`80/443`（或纯 IP 形态的 `8120`）= nginx。两个后端端口都不对公网开放。
+> WSGI 端口可用 `backend/.env` 的 `GIPFEL_WSGI_PORT` 改（改完脚本会同步 nginx upstream，见下节）。
+
+### C1-a 双进程部署（HTTP 与 WebSocket 分离）
+
+**为什么**：改造前只有一个 daphne 进程，Django 的同步视图全部排队给**同一个**线程执行器 ——
+8 个并发请求 = 串行 8 次，全场 100 人时"点一下没反应、15 秒后集体超时"。
+C1-a 把「短请求」与「长连接」拆成两组进程，让 `/api/` 真正并发。
+
+| 进程 | unit | 监听 | 承载 | nginx upstream |
+| --- | --- | --- | --- | --- |
+| daphne（ASGI） | `gipfel.service` | `127.0.0.1:8000` | `/socket.io/*`（+ 回环上仍挂完整 Django 作兼容） | `gipfel_socketio` |
+| gunicorn（WSGI） | `gipfel-wsgi.service`（新增） | `127.0.0.1:8002` | `/api/*`、`/admin/*` | `gipfel_django` |
+| 日志查看器 daphne | `gipfel-logviewer.service` | `127.0.0.1:8121` | 日志查看器整站 | 直连（`log.<域名>` 块） |
+
+- **gunicorn 参数**：`-w 4 -k gthread --threads 8` → 32 路并发（`backend/backend/wsgi.py`，无需新入口）。
+  端口/worker/线程/超时都有 unit 默认值，可用 `backend/.env` 覆盖：
+  `GIPFEL_WSGI_PORT=8002`、`GIPFEL_WSGI_WORKERS=4`、`GIPFEL_WSGI_THREADS=8`、`GIPFEL_WSGI_TIMEOUT=120`。
+  ⚠️ unit 里 `Environment=`（默认值）写在 `EnvironmentFile=` **之前**：systemd 中 `.env` 优先级更高，
+  所以改 `.env` 即可覆盖，不必改 unit（unit 在仓库里，升级会被覆盖）。
+  改了 `GIPFEL_WSGI_PORT` 后重跑部署/升级脚本即可（脚本会把渲染产物里 upstream 的端口一起改掉）；
+  手工改 `.env` 而不重跑脚本，nginx 会继续指向 8002 → 全站 502。
+- **跨进程实时广播**：daphne 进程以 `REALTIME_BUS=hub` 运行（唯一持有 Socket.IO 连接与事件环），
+  gunicorn 进程以 `REALTIME_BUS=forward` 运行，把事件 POST 给 `REALTIME_FORWARD_URL=http://127.0.0.1:8000`
+  的内部端点（排队在独立后台线程，业务请求不等待）。**只启一个进程不会让实时功能"半死"**：
+  单跑 `gipfel.service`（不带 WSGI）时 hub ≡ local，仍等价改造前行为。
+  规模更大/多机时可装 `redis` 并在 `.env` 设 `REALTIME_BUS=redis` + `REALTIME_REDIS_URL`（两端一起覆盖）；
+  **redis 缺失/连不上会降级为回环转发，不影响启动**。
+- **限流（C3）** 现在由 nginx 兜底，按客户端 IP 聚合，取值都按「全场 100 客户端可能共用一个 NAT 出口 IP」估算：
+
+  | 位置 | 指令 | 取值 | 依据 |
+  | --- | --- | --- | --- |
+  | `/api/` | `limit_req` + `limit_conn` | `120r/s, burst=240 nodelay` / `600` 连接 | **Debian 13 真机 100 客户端压测校准**：同一 NAT 出口 IP 下 60r/s 会拦掉 10%~32% 的正常重连（实测 64 / 21 个 429），`120r/s+burst240` 为 **0 个 429**，而最坏 1100 请求风暴仍拦掉 709（后端全程存活）。数据与复现脚本见 [`docs/真机验证报告-Debian13.md`](../docs/真机验证报告-Debian13.md) §T3 |
+  | `= /api/auth/login` | `limit_req`（更严）+ `limit_conn` | `20r/s, burst=120 nodelay` / `600` | 开场 100 人共用出口 IP 同时登录：前 120 个瞬时请求全放行；防爆破由应用层「同 IP+用户名 10 次/5 分钟 → 锁 15 分钟」负责 |
+  | `= /api/health` | **不限流** | — | 监控/部署探针必须永远能通过 |
+  | `/socket.io/` | **只限连接数、不限速** | `200` 连接 | 心跳/polling 被限速会表现为"莫名断线→全场重连"；100 客户端 + 100 条重连余量 |
+
+  超限统一返回 **429**；access log 使用 `gipfel_rt` 格式（含 `$request_time`），现场可直接定位长请求。
+  现场换算口径（改数值前照它算一遍）：单客户端 ≤5 req/s；100 客户端稳态心跳 = 5 req/s（隐藏页 60s → 1.7 req/s）；
+  100 客户端重连尖峰已被前端「并发上限 2 + 指数退避与抖动 + 批量端点」摊平到数秒；同一出口 IP 的在途请求 ≈100~200。
+  > `limit_conn` 的口径（nginx 官方文档 + 作者在邮件列表的澄清，见 `deploy/nginx-gipfel.conf` 注释里的两个链接）：
+  > **只统计"正在处理请求"的连接**，请求处理完进入空闲 keepalive 后不再计数；Socket.IO 这类长连接整条生命周期都被计数。
+  > 所以 `600` 是刻意留了 3 倍余量的**安全上限**，不是常态限制 —— 真正挡洪水的是 `rate`。
+  > ⚠️ **若现场真的出现 429**：先看 access log 的 `rt=`/`urt=`（`$request_time`）与实际速率，判断是真实超限还是阈值过严，
+  > 再按 zone 调 `rate`/`burst`；**不要直接把限流删掉** —— 那等于把重连尖峰原样丢回后端。
+
+  > ⚠️ **经 CDN（Cloudflare）时先配真实客户端 IP**：未配 `set_real_ip_from` / `real_ip_header CF-Connecting-IP`
+  > （见本文档「经 CDN 后的客户端 IP」一节）时，`$remote_addr` 是 CDN 节点 IP，全场流量会落进同一个计数器。
+  > 上面的阈值已按"最坏情况全网算一个 IP"留了余量，但**先配真实 IP 再收紧**才是正确顺序。
+
+**排查（一眼定位）**：
+
+| 现象 | 原因 | 处理 |
+| --- | --- | --- |
+| `/api/*` 全 502，`/socket.io/` 正常 | gunicorn 没起来（或端口不对） | `systemctl status gipfel-wsgi`；`curl -sS http://127.0.0.1:8002/api/health` |
+| 实时消息不动、页面却能用 | daphne 没起来 | `systemctl status gipfel`；`curl -sS 'http://127.0.0.1:8000/socket.io/?EIO=4&transport=polling'` |
+| 登录/接口偶发 **429** | 触发了限流 | 看 `gipfel.error.log` 的 `limiting requests`/`limiting connections`；按上表核对是否配了真实客户端 IP；确属正常业务量再调高 `rate`/`burst`（**改完必须写清依据**） |
+| `/admin/` 打不开 | 与 `/api/` 同因（上游是 gunicorn） | 同上，先看 `gipfel-wsgi` |
+| WSGI 反复重启 | `GIPFEL_WSGI_PORT` 非法/被占用，或 `gunicorn` 未安装 | `journalctl -u gipfel-wsgi -n 50`；`pip install -r backend/requirements.txt` |
+
+**回退到改造前的单进程形态**（C1-a 出问题时的最短路径）：
+
+```bash
+# 1) 停用并移除 WSGI 单元（脚本不会自动删 unit，必须手工做这一步）
+sudo systemctl disable --now gipfel-wsgi
+sudo rm -f /etc/systemd/system/gipfel-wsgi.service && sudo systemctl daemon-reload
+
+# 2) 代码/vhost 回退到改造前的 commit（模板里的 upstream 会自己回到 127.0.0.1:8000）
+sudo git -C /opt/GipfelBusinessCompetitionManagerWeb checkout <改造前的 commit>
+sudo bash scripts/update-from-github.sh \
+  --source-dir /opt/GipfelBusinessCompetitionManagerWeb \
+  --install-dir /opt/gipfel --with-nginx [--domain <域名>]      # 参数与本轮部署保持一致
+
+# 3) 确认 daphne 单进程重新承载全部流量
+curl -sS http://127.0.0.1/api/health && systemctl is-active gipfel gipfel-wsgi
+#    （gipfel-wsgi 显示 inactive/not-found 属预期）
+```
+
+> 不想回退代码时，也可以只把渲染后的 vhost 里 `upstream gipfel_django` 的
+> `server 127.0.0.1:8002;` 改回 `127.0.0.1:8000;` 再 `nginx -t && systemctl reload nginx`
+> （限流指令可保留，也可一并删掉）。这样 `/api/` 又回到 daphne 单线程执行器上 ——
+> 并发问题会回来，但功能正常。
+
 
 ### 日志查看器公网访问（防直连）
 
@@ -287,7 +377,7 @@ sudo bash scripts/deploy-linux.sh \
 
 ### 后端管理后台公网访问（防直连）
 
-后端 `/admin` 管理后台经 nginx 主站点（同域）代理到 `127.0.0.1:8000`，并由 `BackendGateMiddleware` 网关保护：
+后端 `/admin` 管理后台经 nginx 主站点（同域）代理到 `127.0.0.1:8002`（gunicorn/WSGI，C1-a），并由 `BackendGateMiddleware` 网关保护：
 
 - **仅按钮跳转**：前端「系统设置 → 后端管理界面」按钮在点击时向后端 `POST /api/auth/backend-token` 获取一次性（默认 120s）签名令牌（仅 `SUPER_ADMIN` 可获取），拼入 `/admin/?token=...` 打开。后端 `BackendGateMiddleware` 校验令牌，缺失/无效/过期均 302 重定向回前端 SPA——因此直接输入网址、书签、复制链接都会被跳回前端。
 - **nginx 路由前提**：`deploy/nginx-gipfel.conf` 中 `location /admin/` 必须显式代理到后端；若缺失，该路径会被 SPA 兜底 `location /` 吞掉返回 `index.html`，管理后台在公网不可达（该 `location` 已在部署模板中内置）。
@@ -422,7 +512,8 @@ Origin Certificate 最长 15 年，但**若源站 IP 变更、或怀疑私钥泄
 域名前面挂了 Cloudflare（或其它 CDN / 反代）时，**TLS 是两段**：
 
 ```
-访客 ──TLS(CDN 的证书)──► Cloudflare ──TLS(你的证书 + nginx 443)──► nginx ──http──► daphne:8000
+访客 ──TLS(CDN 的证书)──► Cloudflare ──TLS(你的证书 + nginx 443)──► nginx ──┬─http──► gunicorn:8002（/api/、/admin/）
+                                                                          └─http──► daphne:8000（/socket.io/）
 ```
 
 所以 HTTPS 不通时，**第一步是判断断在哪一段**。CDN 的错误码已经告诉你了——这时候去翻 nginx 日志通常什么都没有，因为请求根本没到源站。
@@ -591,7 +682,7 @@ sudo bash scripts/update-from-github.sh \
 ```
 
 脚本自动：
-1) 拉取最新代码 2) 备份 `db.sqlite3`+`uploads`+`.env` 到 `/opt/gipfel/_backup/$(date +%F_%H%M%S)` 3) 更新代码（排除数据文件）4) `pip install -r requirements.txt`（如有新依赖）5) `migrate`（种子幂等）+ `collectstatic`（主后端 + 日志查看器静态资源）6) `npm ci && npm run build` → `frontend-dist/` 7) 纯 IP 自愈（`LOG_VIEWER_PUBLIC_URL` + `DJANGO_ALLOWED_HOSTS`，改写后恢复 `.env` 属主 gipfel 与 600 权限）8) 刷新 systemd 单元（最新 `deploy/*.service` 重新落地）+ `systemctl restart gipfel`（+ `gipfel-logviewer`）9) [--with-nginx] 刷新 vhost 并 reload（含默认站点清理、80 端口校验、**80/443 与 8120 防火墙放行**）。
+1) 拉取最新代码 2) 备份 `db.sqlite3`+`uploads`+`.env` 到 `/opt/gipfel/_backup/$(date +%F_%H%M%S)`（数据库用 `VACUUM INTO` 一致性快照，WAL 安全）3) 更新代码（排除数据文件）4) `pip install -r requirements.txt`（如有新依赖）5) `migrate`（种子幂等）+ `collectstatic`（主后端 + 日志查看器静态资源）6) `npm ci && npm run build` → `frontend-dist/` 7) 纯 IP 自愈（`LOG_VIEWER_PUBLIC_URL` + `DJANGO_ALLOWED_HOSTS`，改写后恢复 `.env` 属主 gipfel 与 600 权限）8) 刷新 systemd 单元（最新 `deploy/*.service` 重新落地，含 C1-a 的 `gipfel-wsgi.service`）+ `systemctl restart gipfel` `gipfel-wsgi`（+ `gipfel-logviewer`）9) [--with-nginx] 刷新 vhost 并 reload（含默认站点清理、80 端口校验、**80/443 与 8120 防火墙放行**）。
 
 > ## ⚠️ 域名部署升级时**必须**带上 `--domain`
 >
@@ -624,6 +715,12 @@ sudo bash scripts/update-from-github.sh \
 > **先看清楚**：`/opt/gipfel/_backup/<时间戳>/` 只含**数据**（`db.sqlite3`、`uploads/`、`.env`），
 > **不含代码**。只恢复数据库不恢复代码，会得到"新代码 + 旧库"或"旧库 + 新代码"的版本错配 ——
 > 尤其是已经跑过 `migrate` 的库，旧代码不一定认它的表结构。所以回滚要**数据与代码一起**做。
+>
+> ⚠️ **WAL 前提（C2 阶段 1 起 SQLite 默认 `journal_mode=WAL`）**：WAL 模式下最近的事务可能还躺在
+> `db.sqlite3-wal` 里，而 `shm` 是它的索引。所以 ①**备份活库不能用 `cp`**（会漏掉 -wal 里的事务，
+> 甚至拿到页不一致的文件）—— 必须是停服后拷贝，或用 `VACUUM INTO` 导出；②**恢复前必须先删掉目标机上
+> 残留的 `-wal`/`-shm`** —— 否则旧库的 WAL 会被 SQLite 当成新库的未提交事务**重放**，得到一个
+> "表结构是旧的、数据却混着新事务"的库（文件头校验、非空校验都查不出来）。
 
 ```bash
 set -e
@@ -632,15 +729,32 @@ cd /opt/GipfelBusinessCompetitionManagerWeb      # 你的 clone 目录
 
 # 0) 先记录当前版本，并把"现在"再备份一份（回滚本身也可能出错）
 sudo git -C /opt/GipfelBusinessCompetitionManagerWeb rev-parse HEAD | tee /tmp/gipfel_rollback_from.txt
-sudo -u gipfel cp -a /opt/gipfel/backend/db.sqlite3 "/opt/gipfel/_backup/db.sqlite3.before-rollback-$(date +%F_%H%M%S)"
+#    ★ WAL 前提：对**运行中**的库直接 `cp` 会漏掉还在 -wal 里的事务，甚至拿到页不一致的文件。
+#      正确顺序是「先停服 → 再用 SQLite 自己导出自洽副本（VACUUM INTO，等价脚本里的
+#      snapshot_sqlite_consistent）」。所以这里把"停服"和"备份"合并成一步：
+sudo systemctl stop gipfel gipfel-wsgi gipfel-logviewer
+sudo rm -f /opt/gipfel/_backup/db.sqlite3.before-rollback.sqlite3     # VACUUM INTO 要求目标不存在
+sudo -u gipfel /opt/gipfel/backend/.venv/bin/python - <<'PY'
+import sqlite3
+con = sqlite3.connect("file:/opt/gipfel/backend/db.sqlite3?mode=ro", uri=True)
+con.execute("VACUUM INTO '/opt/gipfel/_backup/db.sqlite3.before-rollback.sqlite3'")
+con.close()
+print("已导出自洽副本（不含 -wal，可直接落位）: /opt/gipfel/_backup/db.sqlite3.before-rollback.sqlite3")
+PY
 
-# 1) 停服务（避免迁移/替换过程中仍有写入）
-sudo systemctl stop gipfel gipfel-logviewer
+# 1) 服务已在第 0 步停掉（gipfel / gipfel-wsgi / gipfel-logviewer 三个进程都在写这个库）
+#    确认一下再继续：
+systemctl is-active gipfel gipfel-wsgi gipfel-logviewer || true
 
 # 2) 代码回退到上一个可用 tag/commit（不知道退到哪就用 git log --oneline 挑）
 sudo git -C /opt/GipfelBusinessCompetitionManagerWeb checkout <上一个 tag 或 commit>
 
 # 3) 恢复数据
+#    ★★ 必须先删掉 WAL/SHM 残留：旧库留下的 db.sqlite3-wal 会被当成"新库的未提交事务"重放，
+#       把恢复出来的库带偏（症状是数据对不上/库损坏，而文件头与非空校验全都正常）。
+sudo rm -f /opt/gipfel/backend/db.sqlite3-wal /opt/gipfel/backend/db.sqlite3-shm
+#    注：$BK/db.sqlite3 是脚本用 snapshot_sqlite_consistent（VACUUM INTO）产出的自洽副本，
+#        不带 -wal，停服后直接落位即可；若这份副本是手工 cp 的活库，先按第 0 步的方式重导一次。
 sudo -u gipfel cp "$BK/db.sqlite3" /opt/gipfel/backend/db.sqlite3
 [ -d "$BK/uploads" ] && sudo -u gipfel cp -a "$BK/uploads/." /opt/gipfel/backend/uploads/
 [ -f "$BK/.env" ]    && sudo -u gipfel cp "$BK/.env" /opt/gipfel/backend/.env
@@ -653,10 +767,11 @@ cd /opt/GipfelBusinessCompetitionManagerWeb/frontend && sudo npm ci && sudo npm 
 # 若本次升级引入过新迁移，需要退回到旧迁移点（<app> 与迁移名取自 git show <旧commit>:backend/apps/<app>/migrations/）：
 #   sudo -u gipfel /opt/gipfel/backend/.venv/bin/python /opt/gipfel/backend/manage.py migrate <app> <上一个迁移名>
 
-# 5) 起服务并确认
-sudo systemctl start gipfel gipfel-logviewer
+# 5) 起服务并确认（回退到 C1-a 之前时，gipfel-wsgi 不存在是正常的，见「C1-a 双进程部署 → 回退」）
+sudo systemctl start gipfel gipfel-wsgi gipfel-logviewer
 curl -fsS --max-time 5 http://127.0.0.1/api/health && echo " 后端 OK"
-systemctl is-active gipfel gipfel-logviewer
+curl -fsS --max-time 5 http://127.0.0.1:8002/api/health && echo " WSGI OK"
+systemctl is-active gipfel gipfel-wsgi gipfel-logviewer
 ```
 
 > 更稳的做法：不要在服务器上手工挑文件回滚，而是 `git revert` 出问题的那次改动并**重新跑一遍**

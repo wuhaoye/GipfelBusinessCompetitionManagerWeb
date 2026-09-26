@@ -6,6 +6,8 @@
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import re
 
@@ -13,12 +15,14 @@ import logging
 
 from django.conf import settings
 from django.core.signing import TimestampSigner
+from django.http import HttpResponseNotModified
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from apps.common.exceptions import BusinessError
 from apps.common.helpers import client_ip as _client_ip
+from apps.common.helpers import truthy as _truthy
 from apps.common.middleware import (
     normalize_login_username,
     record_login_failure,
@@ -220,13 +224,97 @@ class BackendTokenView(APIView):
 
 
 # ==================== 当前用户 ====================
+def _canonical_me_payload(data: dict) -> str:
+    """把 /auth/me 的响应 data 规范化为稳定字符串（列表先排序），供 ETag 取哈希。
+
+    permissions / companyScopes / viewCompanyScopes 等字段是**集合**语义（顺序无意义），
+    且来源是 role 模板与 JSON 列，顺序不保证跨请求稳定。若不排序就哈希，ETag 会随顺序
+    抖动而每次请求都变 —— 心跳永远拿不到 304，等于没做优化（C3.4 验收项）。
+    """
+    canonical = {
+        k: (sorted(v, key=str) if isinstance(v, list) else v) for k, v in data.items()
+    }
+    return json.dumps(canonical, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def _me_etag(data: dict, variant: str) -> str:
+    """弱 ETag：同一份 data（集合字段排序后）恒定。
+
+    variant 区分两种**表示**（`f`=完整资料 / `l`=light 轻响应）：HTTP 要求不同表示的
+    ETag 必须不同，否则客户端拿轻响应的 ETag 去请求完整资料会被误判 304 而丢字段。
+    """
+    digest = hashlib.sha256(_canonical_me_payload(data).encode("utf-8")).hexdigest()[:32]
+    return f'W/"{variant}-{digest}"'
+
+
+def _strip_weak(tag: str) -> str:
+    """去掉弱校验前缀 `W/`（比较时容忍客户端回传弱/强形态差异）。"""
+    tag = tag.strip()
+    return tag[2:] if tag.startswith("W/") else tag
+
+
+def _if_none_match_hits(request, etag: str) -> bool:
+    """If-None-Match 是否命中当前 ETag：支持 `*`、逗号分隔多值，容忍弱校验前缀。"""
+    raw = request.headers.get("If-None-Match")
+    if not raw:
+        return False
+    target = _strip_weak(etag)
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if part == "*":
+            return True
+        if _strip_weak(part) == target:
+            return True
+    return False
+
+
 class MeView(APIView):
-    """GET /api/auth/me → 当前登录用户资料"""
+    """GET /api/auth/me → 当前登录用户资料（C3：条件请求 + 轻响应，契约见设计说明 §4.1）。
+
+    - 无参：响应体与改造前**逐字段一致**，仅新增 `ETag` 响应头（状态未变则值不变）；
+    - `If-None-Match` 命中 → **304 空体 + 同一 ETag**（省掉响应体与序列化开销）；
+    - `?light=1` → data 仅 `{id, tokenVersion, isActive, mustChangePassword}`，
+      全局信封 `{code,message,data}` 不变；
+    - 开关 `AUTH_ME_CONDITIONAL_ENABLED=false` → 以上三项全部退化为改造前行为
+      （不写 ETag、不校验 If-None-Match、忽略 light，始终返回完整资料）；
+    - **401 语义一个字都不变**：失效 / 被顶号（token_version 不一致）/ 强制改密门禁
+      都由 JWTAuthentication 在进入本视图前抛出，本视图既不参与也不改写任何 401 分支
+      —— 心跳正是靠它感知顶号。
+    """
 
     permission_classes = (IsAuthenticated,)
 
     def get(self, request):
-        return Response(serialize_user(request.user))
+        user = request.user
+
+        # 开关关闭：完全回到改造前行为（不写 ETag / 不看 If-None-Match / 忽略 light）
+        if not getattr(settings, "AUTH_ME_CONDITIONAL_ENABLED", True):
+            return Response(serialize_user(user))
+
+        if _truthy(request.query_params.get("light")):
+            data = {
+                "id": user.id,
+                "tokenVersion": getattr(user, "token_version", 0),
+                "isActive": getattr(user, "is_active", True),
+                "mustChangePassword": getattr(user, "must_change_password", False),
+            }
+            etag = _me_etag(data, "l")
+        else:
+            data = serialize_user(user)
+            etag = _me_etag(data, "f")
+
+        if _if_none_match_hits(request, etag):
+            # 304 必须空体：直接用 Django 的 HttpResponseNotModified，不经 DRF 渲染器
+            # （经渲染器会把 {code,message,data} 塞进 304 响应体，违反 HTTP 语义）。
+            not_modified = HttpResponseNotModified()
+            not_modified["ETag"] = etag
+            return not_modified
+
+        response = Response(data)
+        response["ETag"] = etag
+        return response
 
 
 # ==================== 修改密码 ====================

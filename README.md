@@ -15,17 +15,19 @@
 │  Django 5 后端                                              │
 │  · daphne ASGI server（HTTP + WebSocket 同源同端口 :8000）  │
 │  · DRF：40 张业务表 / 27 个 app / 统一 CRUD 基类            │
-│  · JWT + RBAC：39 个权限键（19 个域）、5 级动作等级         │
+│  · JWT + RBAC：42 个权限键（20 个域）、5 级动作等级         │
 │  · 实时广播：Socket.IO Rooms（comp-{id} + user-{id}）       │
 │  · 合同引擎 / 股票引擎 / 产业计算图                         │
-│  · SQLite（默认）/ PostgreSQL（生产）                       │
+│  · 快照与回退：全库快照 + 强制暂停(423) + 整体回退 + 版本同步│
+│  · SQLite（当前唯一实现，已开 WAL + busy_timeout=20s；PostgreSQL 属 C2 阶段 2）│
 └─────────────────────────────────────────────────────────────┘
 ```
 
 - **前端端口**：开发 `:5173`（Vite，自动代理 `/api` `/socket.io` `/uploads` 到 `:8000`），生产由 nginx 托管 `frontend-dist/`（或开发态 Django `STATIC_ROOT` 兜底）
-- **后端端口**：Daphne 默认 `:8000`
+- **后端端口**：Daphne 默认 `:8000`（开发态与回环直连）；生产 C1-a 整改后由 nginx 分流 —— `/api/`、`/admin/` → **gunicorn WSGI `127.0.0.1:8002`（多 worker）**，`/socket.io/` → daphne `127.0.0.1:8000`
 - **上传目录**：`backend/uploads/`（环境变量 `UPLOAD_DIR`）
-- **数据库**：`backend/db.sqlite3`（默认，环境变量 `DATABASE_URL` 可切换）
+- **数据库**：`backend/db.sqlite3`（**当前硬编码 sqlite3**；调优开关见 `backend/.env.example` 的 C2 阶段 1 段）。
+  ⚠️ **没有** `DATABASE_URL` 支持：切 PostgreSQL 属于《架构性运维约束整改简报.md》的 **C2 阶段 2**，需要「加 `psycopg` 依赖 + 改 `settings.DATABASES` + 建库迁移数据」三件事，不是改一个环境变量就能生效（改造前的 README 此处声明与代码不符，已更正）
 - **日志**：`backend/logs/`（环境变量 `LOG_DIR`）
 
 ---
@@ -77,7 +79,9 @@ GipfelBusinessCompetitionManagerWeb/
 │   │   ├── messages/                消息中心
 │   │   ├── announcements/           公告管理
 │   │   ├── widget_packages/         自定义控件包管理
+│   │   ├── snapshots/               快照与回退（全库快照 / 强制暂停 / 整体回退 / 版本同步）
 │   │   └── files/                   上传
+│   ├── snapshots/                   快照归档目录（SNAPSHOT_DIR，gitignore，升级不清除）
 │   ├── logviewer/                   独立日志查看器站点（默认 :8120，见下）
 │   ├── manage.py
 │   ├── requirements.txt
@@ -106,22 +110,31 @@ GipfelBusinessCompetitionManagerWeb/
 │   └── update-from-github.sh        Linux 增量升级（拉取最新 + 备份 + 迁移 + 构建 + 重启，保留数据）
 │
 ├── deploy/
-│   ├── gipfel.service               systemd unit 模板（主后端）
+│   ├── gipfel.service               systemd unit 模板（daphne ASGI，承载 /socket.io/，回环直连兼容）
+│   ├── gipfel-wsgi.service          systemd unit 模板（C1-a：gunicorn WSGI，承载 /api/、/admin/）
 │   ├── logviewer.service            systemd unit 模板（日志查看器）
-│   └── nginx-gipfel.conf            nginx 虚拟主机模板
+│   └── nginx-gipfel.conf            nginx 虚拟主机模板（限流 + $request_time 日志格式）
 │
 ├── widget-package-examples/         自定义控件包示例（progress-bar、simple-card）
 ├── architecture_diagram/            架构图资源
-├── tests/                           端到端冒烟测试
-├── logs/                            开发期日志（生产由 backend/logs/ 托管）
+├── tests/                           验证与探针脚本（fix_verify 回归套件 / ops_check 独立验收 / snapshot_tools）
+├── logs/                            开发期日志（gitignore；生产由 backend/logs/ 托管）
 ├── uploads/                         开发期上传文件（生产由 backend/uploads/ 托管）
-├── docs/
-│   ├── OPS.md                         运维文档（日常操作手册）
-│   ├── CUSTOM_WIDGET_GUIDE.md         自定义仪表盘控件开发指南
-│   └── Vue-Django迁移设计.md           技术迁移方案 / API 契约 / 阶段进度
+├── docs/                            **全部文档的唯一入口**
+│   ├── README.md                       ← 文档索引：按主题分组导航下面全部文档
+│   ├── OPS.md · MIGRATION.md · SNAPSHOT_SYSTEM.md · CUSTOM_WIDGET_GUIDE.md · Vue-Django迁移设计.md
+│   ├── 架构性运维约束整改简报.md · 运维约束整改设计说明.md · 架构性运维约束整改验收报告.md
+│   ├── 真机验证报告-Debian13.md · WSL与生产环境验证操作手册.md · WSL与生产环境验证结果记录.md
+│   ├── BUILD_COMPETITION_API_REFERENCE.md · BUILD_COMPETITION_BY_CODE.md · CONTRACT_TYPE_BY_CODE.md
+│   ├── 比赛Excel建包教程.md · 比赛Excel建包规范.md · 合同可视化新建操作指南.md · 汽车产业链测试赛准备.md
+│   ├── 赛务运维分析.md · 比赛系统缺陷与改进方案.md · 硬阻断B_推进财年改造方案.md
+│   ├── audit/                          代码缺陷审计归档（总报告 + 366 条索引 + 21 个审计单元 + 规则转录）
+│   └── branch-diff/                    master 与 bugfix-merged 分支差异报告与生成脚本
 ├── VERSION.json                     全局版本号（前端 prebuild 读取）
 └── README.md                        ← 你现在正在看的
 ```
+
+> **文档去哪了**：仓库根目录**只保留本 README**。其余文档（含整改、审计、赛务分析、验证记录）全部在 [`docs/`](docs/README.md) 下，入口是 [docs/README.md](docs/README.md)。
 
 ---
 
@@ -206,6 +219,7 @@ scripts\start-dev.bat
 - **登录限流**：`LoginRateLimitMiddleware` **只拦截** `POST /api/auth/login`——同一 IP + 用户名在 5 分钟窗口内累计失败 10 次即锁定 15 分钟并返回 429。阈值是 `apps/common/middleware.py` 里的常量（`_FAIL_WINDOW` / `_FAIL_THRESHOLD` / `_LOCK_DURATION`），非环境变量；锁定状态存进程内存，**重启后端即清空**。项目目前**没有**全局 HTTP 限流中间件
 - **乐观锁**：公司字段写操作携带 `version`，冲突 409 提示前端重试
 - **删公司两步确认**：`DELETE /api/companies/:id` 先返回「删除影响预览」，前端二次确认带 `confirmName` 才执行
+- **快照与强制暂停**：`apps/snapshots` 提供全库快照与整体回退；「强制暂停」期间中间件拒绝全部业务写入（HTTP **423**）并向所有在线客户端广播全屏遮罩，回退完成后 `data_version` +1，各客户端比对版本号后清空本地缓存并整体重载 —— 详见 [docs/SNAPSHOT_SYSTEM.md](docs/SNAPSHOT_SYSTEM.md)
 - **审计日志**：`apps/common/signals.py` 对**已在 `MODEL_TO_RESOURCE` 注册**的模型统一挂 `post_save`/`post_delete` → `AuditLog` 表落库，含 operator、IP、changes JSON 快照；映射值为 `None` 的子表（仅列名映射、不广播）不落审计
 
 ---
@@ -267,6 +281,9 @@ python manage.py makemigrations         # 生成模型迁移
 python manage.py migrate                # 应用迁移（+ 自动 seed 默认 admin）
 python manage.py createsuperuser        # 另一种建超管方式
 python manage.py shell                  # ORM shell
+python manage.py snapshot_auto          # 自动快照（按 SnapshotPolicy，可配 cron）
+python manage.py snapshot_restore --list    # 列出快照 / 应急命令行回退（--id N --yes）
+python manage.py test apps.snapshots    # 快照与回退系统回归测试
 python manage.py runserver 127.0.0.1:8000 # 开发用；daphne 已在 INSTALLED_APPS 接管 runserver，实际跑的是 ASGI
 python manage.py rundaphne                 # 生产推荐：默认绑定 127.0.0.1（端口取 .env 的 PORT），由 nginx 反代对外
 # 仅局域网/容器内联调临时需要时再 --bind 0.0.0.0：daphne -b 127.0.0.1 -p 8000 backend.asgi:application

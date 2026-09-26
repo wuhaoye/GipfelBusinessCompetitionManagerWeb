@@ -6,6 +6,7 @@ import { getAccountItem, setAccountItem, removeAccountItem, setActiveUser } from
 import { logger } from "@/utils/logger";
 import { disconnectRealtime } from "@/realtime/socket";
 import { hasPermission } from "@/permissions/catalog";
+import { resetGateState } from "@/system/gate";
 
 export interface UserInfo {
   id: number;
@@ -137,6 +138,8 @@ export const useAuthStore = defineStore("auth", () => {
     // 账号隔离：先建立激活账号指针，再写入该账号命名空间下的 token，使后续请求 / 缓存都归属该账号。
     setActiveUser(res.user.id);
     setAccountItem("token", res.token);
+    // 换账号 / 重新登录：丢弃上一个会话的条件请求凭据（ETag 与账号相关），下次心跳重新获取。
+    heartbeatEtag = null;
     startHeartbeat();
     notifyLoggedIn();
   }
@@ -161,9 +164,71 @@ export const useAuthStore = defineStore("auth", () => {
   // 绝大多数 GET 走本地缓存、不发网络，旧设备停在界面浏览时不会触发任何被守卫的请求，
   // 也就不会被后端 tokenVersion 校验踢掉。心跳周期性向 /auth/me 真实打网络，
   // 一旦被新设备登录顶号（tokenVersion 不一致 → 后端 401），响应拦截器会清空登录态并跳转登录页。
-  // 20s 间隔：作为 socket 实时通道之外的兜底，保证即使 WebSocket 断连也能在 20s 内感知顶号。
-  const HEARTBEAT_INTERVAL_MS = 20 * 1000;
+  //
+  // C3 改造（运维约束整改设计说明 §4.3 / 简报 C3.3）：
+  //   ① 自适应间隔：页面可见 20s、document.hidden 时 60s —— 直接削掉稳态 5 req/s 的大头；
+  //   ② 条件请求：?light=1 + If-None-Match，服务端未变更时回 304（空体）；
+  //      304 视为成功、不更新任何状态；200 时保存新的 ETag 供下次条件请求（§4.1）；
+  //   ③ 重新可见时补一次对账心跳 —— 仅当本次隐藏时长 ≥ 可见间隔（20s）才补：
+  //      隐藏 <20s 时本就没有漏掉任何一次心跳（隐藏期间间隔 60s，刚隐藏就切回远未到点），
+  //      补打只会把「主持人频繁切窗口」变成额外 /auth/me 请求，与 C3 削稳态请求数的目标相反。
+  // 不变语义：mustChangePassword 期间不启动；logout/stopHeartbeat 行为不变；
+  // 401 仍由全局响应拦截器处理（清登录态 + auth:kicked），本地绝不吞掉。
+  const HEARTBEAT_INTERVAL_VISIBLE_MS = 20 * 1000;
+  const HEARTBEAT_INTERVAL_HIDDEN_MS = 60 * 1000;
   let heartbeatTimer: number | null = null;
+  /** 上一次 /auth/me 响应头里的 ETag（条件请求凭据）；登录 / 登出时清空。
+   *  注意：后端 light 与完整两种表示的 ETag **不同**（api-c3 契约：W/"l-…" / W/"f-…"），
+   *  这里存的始终是 `?light=1` 那一次的 ETag，因此**只能**回带给带 light=1 的心跳请求；
+   *  完整资料的请求（fetchProfile / refreshProfile）一律不带 If-None-Match。 */
+  let heartbeatEtag: string | null = null;
+  /** 单次心跳在途标记：慢网络下不叠加并发心跳。 */
+  let heartbeatInFlight = false;
+  /** 本次「进入隐藏」的时刻；切回前台时据此判断隐藏时长（见 handleVisibilityChange）。
+   *  null = 当前不在隐藏态（或隐藏起点未知）。 */
+  let heartbeatHiddenAt: number | null = null;
+
+  function isDocumentHidden(): boolean {
+    return typeof document !== "undefined" && document.hidden === true;
+  }
+
+  /** 当前该用的心跳间隔：可见 20s / 隐藏 60s（自适应）。 */
+  function heartbeatIntervalMs(): number {
+    return isDocumentHidden() ? HEARTBEAT_INTERVAL_HIDDEN_MS : HEARTBEAT_INTERVAL_VISIBLE_MS;
+  }
+
+  /** 单次对账心跳：条件请求；304 = 成功且无副作用。 */
+  async function beatHeartbeat(): Promise<void> {
+    if (heartbeatInFlight) return;
+    if (!token.value) {
+      stopHeartbeat();
+      return;
+    }
+    heartbeatInFlight = true;
+    try {
+      const headers: Record<string, string> = {};
+      if (heartbeatEtag) headers["If-None-Match"] = heartbeatEtag;
+      // cache:false 绕过本地缓存层真实打网络；silent:true 瞬时网络抖动不打扰用户；
+      // conditional:true 只对本调用放开 304（validateStatus）并保留 status/headers 以便读 ETag。
+      // light=1 只取 {id,tokenVersion,isActive,mustChangePassword}，响应体最小（设计说明 §4.1）。
+      const res: any = await api.get("/auth/me", {
+        cache: false,
+        silent: true,
+        conditional: true,
+        params: { light: 1 },
+        headers,
+      });
+      // 304：会话与资料均未变更（成功，无事可做，ETag 沿用服务端回传的同值）。
+      // 200：保存新 ETag，供下一次条件请求使用。
+      const etag = res?.headers?.etag ?? res?.headers?.ETag;
+      if (typeof etag === "string" && etag) heartbeatEtag = etag;
+    } catch {
+      // 401（被顶号 / 会话失效）已由全局响应拦截器处理：清空登录态 + 派发 auth:kicked + 跳登录页。
+      // 这里**绝不**本地吞掉 401 或自行清登录态；其余错误静默忽略，不中断心跳。
+    } finally {
+      heartbeatInFlight = false;
+    }
+  }
 
   function stopHeartbeat() {
     if (heartbeatTimer != null) {
@@ -179,19 +244,38 @@ export const useAuthStore = defineStore("auth", () => {
     // 误判成「会话过期」而清掉 token，用户提交改密即报「登录已过期」（真机事故）。
     // 后端现已把 /auth/me 列入豁免，这里再保一层：改密成功后再由 changePassword 启动心跳。
     if (user.value?.mustChangePassword) return;
-    heartbeatTimer = window.setInterval(async () => {
-      if (!token.value) {
-        stopHeartbeat();
-        return;
-      }
-      try {
-        // cache:false 确保绕过本地缓存层真实打网络；silent:true 避免瞬时网络抖动打扰用户。
-        // 成功无副作用；被顶号时后端返回 401，由响应拦截器统一处理（清空登录态 + 跳转 + 派发事件）。
-        await api.get("/auth/me", { cache: false, silent: true });
-      } catch {
-        // 401 已由响应拦截器处理；其余错误静默忽略，不中断心跳。
-      }
-    }, HEARTBEAT_INTERVAL_MS);
+    // 隐藏起点未知但当前是隐藏态（如后台标签页里登录）→ 以此刻为起点，切回前台时同样能判断隐藏时长。
+    if (heartbeatHiddenAt == null && isDocumentHidden()) heartbeatHiddenAt = Date.now();
+    heartbeatTimer = window.setInterval(() => { void beatHeartbeat(); }, heartbeatIntervalMs());
+  }
+
+  /** 可见性变化：按新的可见性重设定时器；重新可见且**本次隐藏 ≥ 可见间隔**时补一次对账心跳。
+   *  心跳未在运行（未登录 / 强制改密中 / 已 stop）时不因可见性事件启动，保持既有语义。 */
+  function handleVisibilityChange() {
+    if (heartbeatTimer == null) return;
+    if (isDocumentHidden()) {
+      heartbeatHiddenAt = Date.now(); // 记录隐藏起点（切回前台时据此判断是否补打）
+      startHeartbeat(); // 切到隐藏：60s
+      return;
+    }
+    const hiddenMs = heartbeatHiddenAt == null ? null : Date.now() - heartbeatHiddenAt;
+    heartbeatHiddenAt = null;
+    startHeartbeat(); // 恢复可见：20s
+    // 门槛：隐藏 <20s 时隐藏期间本就没有到点的心跳（隐藏间隔才 60s），补打纯属多发请求。
+    if (hiddenMs != null && hiddenMs >= HEARTBEAT_INTERVAL_VISIBLE_MS) void beatHeartbeat();
+  }
+
+  // 注册可见性监听：真实浏览器把 visibilitychange 派发在 document（事件冒泡）；
+  // Node 浏览器桩的 document 无 addEventListener，故回退到 window，便于回归用例驱动同一套代码。
+  const visibilityTarget: EventTarget | null =
+    typeof document !== "undefined" && typeof document.addEventListener === "function"
+      ? document
+      : typeof window !== "undefined"
+        ? window
+        : null;
+  if (visibilityTarget) {
+    visibilityTarget.removeEventListener("visibilitychange", handleVisibilityChange);
+    visibilityTarget.addEventListener("visibilitychange", handleVisibilityChange);
   }
 
   /** 建立有效登录态后广播：启动阶段因无 token 而失败的一次性加载（自定义控件包，审计 M-01）
@@ -202,6 +286,10 @@ export const useAuthStore = defineStore("auth", () => {
 
   function logout() {
     stopHeartbeat();
+    // 条件请求凭据随会话一起失效（登出 / 被顶号后 ETag 不再代表当前账号的资料版本）。
+    heartbeatEtag = null;
+    // 隐藏起点同样作废：下次登录重新计时，避免用上一会话的隐藏时长触发补打。
+    heartbeatHiddenAt = null;
     token.value = "";
     user.value = null;
     // 清空请求层内存 memo（登出 / 换账号 / 被顶号都走这里）：memo 是模块级共享状态且键不含
@@ -215,6 +303,9 @@ export const useAuthStore = defineStore("auth", () => {
     // 仅移除账号命名空间下的 token（保留该账号其余已持久化数据，下次登录可恢复）；
     // activeUserId 指针保留，由 token 是否存在决定登录态（见 competition.loadFromStorage 守卫）。
     removeAccountItem("token");
+    // 清空全局门禁（强制暂停/回退）遮罩态：否则登出后停在登录页仍会被上一个账号的
+    // 「系统已暂停」遮罩盖住，且写请求会被误拦。
+    resetGateState();
     // 清除当前选中的比赛：登录态切换（登出 / 被顶号）后不应残留上一个账号/上一次会话选中的比赛，
     // 否则 competition.loadFromStorage 会以残留的比赛 id 拉取财年，触发归属校验（越权）返回空，
     // 表现为「登录后左上角财年显示错误 / 未开启财年」。下次登录由 applyOwnCompetition 按归属比赛重新锁定。

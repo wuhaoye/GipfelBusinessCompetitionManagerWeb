@@ -25,6 +25,14 @@ CONTRACT_ACTION_RANKS = {
     "manage": 40,
 }
 
+# 快照域自定义等级：restore（强制暂停 + 回退）是最高等级动作，
+# 持有 restore 自动蕴含 manage / view；反之不成立。
+SNAPSHOT_ACTION_RANKS = {
+    "view": 10,
+    "manage": 20,
+    "restore": 30,
+}
+
 
 # ==================== 目录定义 ====================
 PERMISSION_CATALOG = [
@@ -199,6 +207,17 @@ PERMISSION_CATALOG = [
             {"key": "stock:manage", "action": "manage", "label": "高级管理（看全部 / 增删股票 / 推进轮次）"},
         ],
     },
+    {
+        "key": "snapshot",
+        "label": "快照与回退",
+        "group": "系统",
+        "actionRank": SNAPSHOT_ACTION_RANKS,
+        "actions": [
+            {"key": "snapshot:view", "action": "view", "label": "查看快照列表 / 详情 / 校验"},
+            {"key": "snapshot:manage", "action": "manage", "label": "创建 / 删除 / 清理快照，设置保留策略"},
+            {"key": "snapshot:restore", "action": "restore", "label": "强制暂停全体并回退数据"},
+        ],
+    },
 ]
 
 ALL_PERMISSION_KEYS = [a["key"] for d in PERMISSION_CATALOG for a in d["actions"]]
@@ -320,6 +339,10 @@ SUPER_ADMIN_ONLY_PERMISSIONS = [
     "competition:manage",
     "account:manage",
     "stock:manage",
+    # 快照/回退会读写全库、强制暂停全体用户，且涉及跨比赛数据，仅超管可持有
+    "snapshot:view",
+    "snapshot:manage",
+    "snapshot:restore",
 ]
 
 # COMPETITION_ADMIN 可选扩展集（默认不开放，超管可按需放开）

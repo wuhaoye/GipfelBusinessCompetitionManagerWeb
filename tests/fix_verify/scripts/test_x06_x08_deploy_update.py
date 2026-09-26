@@ -91,10 +91,22 @@ class X07StaleCodeTests(unittest.TestCase):
         self.assertIn("代码在本轮更新期间发生了变化", self.code, "收尾必须核对并告警")
 
     def test_stale_mode_warns_before_migrate(self):
-        """降级模式下执行 migrate 前必须再次告警。"""
-        idx = self.code.index('manage.py migrate --noinput')
-        window = self.code[max(0, idx - 700): idx]
-        self.assertIn("沿用本地旧代码", window, "migrate 前应明确告警")
+        """降级模式下执行 migrate 前必须再次告警。
+
+        改前这里用「migrate 前 700 字符」的固定窗口找告警文本；2026-09-26 在 migrate 之前
+        新增了「停服（WAL 切换要求独占该库）」步骤（真机事故修复，见
+        docs/真机验证报告-Debian13.md §7.6），把告警挤出了窗口 → 用例误报失败。
+        现改为**位置断言**（告警必须出现在 migrate 之前、且在 pull 失败分支内），
+        比固定窗口更强也更稳，任何新增步骤都不会让它假失败。
+        """
+        warn_at = self.code.find("沿用本地旧代码")
+        self.assertNotEqual(warn_at, -1, "降级模式必须有「沿用本地旧代码」告警")
+        migrate_at = self.code.index("manage.py migrate --noinput")
+        self.assertLess(warn_at, migrate_at, "旧代码告警必须出现在 migrate 之前")
+        # 告警必须挂在 pull 失败分支里（不是无条件打印）：从分支起点到告警之间不得出现分支结束
+        branch_at = self.code.find('if [[ "${PULL_FAILED:-0}" == 1 ]]')
+        self.assertNotEqual(branch_at, -1, "必须有 PULL_FAILED 分支")
+        self.assertNotIn("\nfi\n", self.code[branch_at:warn_at], "告警应位于 PULL_FAILED 分支内")
 
     def test_no_unconditional_degrade_message(self):
         """改前那句「已降级为使用本地现有代码继续更新」不得再作为默认行为出现。"""

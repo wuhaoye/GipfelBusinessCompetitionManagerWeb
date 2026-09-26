@@ -12,6 +12,13 @@
     但 `_backup/*` **只含数据不含代码与 frontend-dist**：按文档"回滚"后仍在跑新版代码，
     得到"数据与代码版本不匹配"的更复杂故障；`cp` 失败也没有任何校验。
 
+★ C1-a / C2 追加（2026-09，本用例随之加强，不放松）：
+  · 写库的进程从 2 个变成 3 个（多了 gunicorn/WSGI），所以不再断言
+    "systemctl stop gipfel gipfel-logviewer" 这一字面量，改为断言**同一条命令覆盖三个进程**；
+  · C2 阶段 1 起 SQLite 为 WAL 模式，回滚前备份当前库不再能用 `cp -a` 活库，
+    改为要求 `VACUUM INTO` 自洽导出 + 恢复前 `rm -f db.sqlite3-wal/-shm`——
+    断言的是更强的性质（副本自洽、残留已清），比原来的字面量匹配更能防回归。
+
 运行：backend/.venv/Scripts/python.exe tests/fix_verify/scripts/test_x26_readme_rollback.py
 """
 
@@ -100,17 +107,39 @@ class X26RollbackTests(unittest.TestCase):
 
     def test_section_covers_code_and_data(self):
         for needle in (
-            "systemctl stop gipfel gipfel-logviewer",
             "git -C /opt/GipfelBusinessCompetitionManagerWeb checkout",
             "rev-parse HEAD",
-            "cp -a /opt/gipfel/backend/db.sqlite3",
             "pip install -r",
             "npm ci",
             "manage.py migrate <app>",
-            "systemctl start gipfel gipfel-logviewer",
             "api/health",
         ):
             self.assertIn(needle, self.section, f"回滚章节缺少：{needle}")
+
+        # 回滚前必须先备份「当前」这份库。C2 阶段 1 起 SQLite 是 WAL 模式，
+        # 对**活库** `cp` 会漏掉 -wal 里的事务、甚至拿到页不一致的文件，
+        # 因此不再要求旧的 `cp -a .../db.sqlite3` 写法，而要求停服后用 VACUUM INTO 导出自洽副本
+        # （用更强的方法满足同一意图：回滚前一定有一份可用的当前库副本）。
+        self.assertIn("before-rollback", self.section, "必须先备份当前库（回滚本身也可能出错）")
+        self.assertIn("VACUUM INTO", self.section, "活库副本必须用 VACUUM INTO 导出（WAL 安全）")
+
+        # 停/起服：C1-a 之后写库的进程是三个（gipfel / gipfel-wsgi / gipfel-logviewer），
+        # 命令必须都带上 —— 只停两个会出现"以为停了、其实 WSGI 还在写库"。
+        stop_lines = [ln for ln in self.section.splitlines() if "systemctl stop" in ln]
+        start_lines = [ln for ln in self.section.splitlines() if "systemctl start" in ln]
+        self.assertTrue(stop_lines and start_lines, "回滚章节必须给出停服/起服命令")
+        for lines, label in ((stop_lines, "停服"), (start_lines, "起服")):
+            self.assertTrue(
+                any(
+                    all(s in ln for s in ("gipfel", "gipfel-wsgi", "gipfel-logviewer"))
+                    for ln in lines
+                ),
+                f"{label}命令必须同时覆盖 daphne/WSGI/日志查看器三个进程：{lines}",
+            )
+
+        # WAL：恢复前先删残留
+        self.assertIn("db.sqlite3-wal", self.section, "恢复前必须删 -wal 残留")
+        self.assertIn("db.sqlite3-shm", self.section, "恢复前必须删 -shm 残留")
 
     def test_section_no_longer_is_two_liner(self):
         self.assertGreater(len(self.section.splitlines()), 20, "回滚章节仍然过短")
