@@ -580,6 +580,7 @@ def write_csv_dir(path: str | Path, tables: dict[str, list[list]]) -> Path:
 ### 附：本次为验证而生成的只读脚本与临时文件（均可删除，未触碰仓库业务代码与数据库）
 
 - `code_audit/_b06_probe1.py` ~ `_b06_probe11.py`：读 xlsx → 内存建包 → 打印，以及手工构造 xlsx 部件验证单元格边界。**没有调用 `apply_import`**。
+  （⚠️ 这 11 个一次性探针与 `_b06_out/` 属过程产物，**未随仓库提供**，已移出到 `../gipfel-archive-20260926/`；本节结论由文档内嵌的证据自洽。）
 - `code_audit/_b06_out/`：探针构造的临时 xlsx / CSV / 标记文件。
 - 查库仅使用只读连接：`sqlite3.connect("file:db.sqlite3?mode=ro", uri=True)`。
 - 另外以只读方式跑过三次官方命令：`build_from_sheets.py examples/excel/{汽车产业链示例,最小示例,比赛建包模板}.xlsx --inspect`（退出码均为 0，未写库）。

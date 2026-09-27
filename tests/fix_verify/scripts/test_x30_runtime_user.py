@@ -14,7 +14,7 @@
 - 同一 PATH 依赖还会让 `nginx -t`（`/usr/sbin/nginx`）二次引爆。
 
 本机无 Linux/bash 保证，故沿用本目录既有约定：**静态语义核对 + Python 等价行为复现**
-（真机端到端另由 `code_audit/_repro_gipfel_user_group.sh` 与 Debian 13 实测覆盖）。
+（真机端到端另由 `code_audit/harness/_repro_gipfel_user_group.sh` 与 Debian 13 实测覆盖）。
 
 用法（仓库根目录）：
     backend\\.venv\\Scripts\\python.exe -m unittest tests.fix_verify.scripts.test_x30_runtime_user -v

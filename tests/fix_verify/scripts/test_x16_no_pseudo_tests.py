@@ -92,9 +92,9 @@ class X16NoPseudoTests(unittest.TestCase):
         import subprocess
         import sys
 
-        checker = REPO / "code_audit" / "_x16_strip_check.py"
+        checker = REPO / "code_audit" / "harness" / "_x16_strip_check.py"
         if not checker.is_file():
-            self.skipTest("等价性校验脚本不存在（非交付物，允许缺失）")
+            self.skipTest("等价性校验脚本不存在（应随仓库提供：code_audit/harness/_x16_strip_check.py）")
         proc = subprocess.run(
             [sys.executable, str(checker)],
             capture_output=True,

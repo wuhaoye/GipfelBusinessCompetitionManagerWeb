@@ -1,0 +1,75 @@
+
+[36m== 0. 环境自述 ==[0m
+  GNU bash, version 5.3.9(1)-release (x86_64-pc-linux-gnu)
+  Python 3.14.4 / init=systemd / systemd=running
+  python3 sqlite3=3.46.1
+
+[36m== 1. 全部 shell 脚本语法（真 Linux bash） ==[0m
+  [32mPASS[0m bash -n scripts/deploy-linux.sh
+  [32mPASS[0m bash -n scripts/lib/deploy-common.sh
+  [32mPASS[0m bash -n scripts/migrate-server.sh
+  [32mPASS[0m bash -n scripts/quick-sync.sh
+  [32mPASS[0m bash -n scripts/update-from-github.sh
+  [32mPASS[0m bash -n scripts/verify-migration.sh
+  [32mPASS[0m bash -n tests/deploy_public_ip_test.sh
+  [32mPASS[0m bash -n tests/gipfel-logviewer-diag.sh
+
+[36m== 2. tests/deploy_public_ip_test.sh（三种 cwd） ==[0m
+  [32mPASS[0m cwd=/mnt/c/Users/wuhao/Desktop/shang/gipfel/GipfelBusinessCompetitionManagerWeb/tests → 结果：PASS=36 FAIL=0（仓库根：/mnt/c/Users/wuhao/Desktop/shang/gipfel/GipfelBusinessCompetitionManagerWeb）
+  [32mPASS[0m cwd=/mnt/c/Users/wuhao/Desktop/shang/gipfel/GipfelBusinessCompetitionManagerWeb → 结果：PASS=36 FAIL=0（仓库根：/mnt/c/Users/wuhao/Desktop/shang/gipfel/GipfelBusinessCompetitionManagerWeb）
+  [32mPASS[0m cwd=/tmp → 结果：PASS=36 FAIL=0（仓库根：/mnt/c/Users/wuhao/Desktop/shang/gipfel/GipfelBusinessCompetitionManagerWeb）
+
+[36m== 3. scripts/lib/deploy-common.sh 纯函数 ==[0m
+  [32mPASS[0m absolutize_dir ./a/b/../c（=/tmp/a/c）
+  [32mPASS[0m absolutize_dir /opt/gipfel//x/..（=/opt/gipfel）
+  [32mPASS[0m log_viewer_port 读取 9000（=9000）
+[deploy][warn] LOG_VIEWER_PORT=abc 非法（需 1-65535 整数），回退默认 8120
+  [32mPASS[0m log_viewer_port 非法回退（=8120）
+
+[36m== 4. snapshot_sqlite_consistent（真实 python3 + WAL 活库） ==[0m
+  [32mPASS[0m snapshot_sqlite_consistent 成功
+  INFO plain.sqlite3: 打不开/损坏 -> no such table: t
+  INFO snap.sqlite3: integrity=ok rows=3000
+
+[36m== 5. scripts/migrate-server.sh 退出码与 --dry-run ==[0m
+  [32mPASS[0m --help（=0）
+  [32mPASS[0m 未知参数（=2）
+  [32mPASS[0m 缺 --mode（=1）
+  [32mPASS[0m --ssh-port abc（=2）
+  [32mPASS[0m --dry-run --mode pull 退出码（=0）
+  [32mPASS[0m --dry-run 打印了预演计划
+  [32mPASS[0m --dry-run 未发起真实连接
+  [32mPASS[0m --dry-run 无临时目录残留（=0）
+
+[36m== 6. scripts/quick-sync.sh（相对 INSTALL_DIR / push 源校验 / SSH 选项） ==[0m
+  [32mPASS[0m 不存在的推送源被拒绝
+  [32mPASS[0m SSH 选项被识别
+  [32mPASS[0m 给了 known_hosts 不再告警 accept-new
+  [32mPASS[0m 非法 --ssh-port（=RC=2）
+
+[36m== 7. scripts/deploy-linux.sh（帮助 / 口令默认不打印 / 退出码语义） ==[0m
+  [32mPASS[0m 帮助里有 --print-seed-password
+  [32mPASS[0m 帮助里有 --allow-partial
+  [32mPASS[0m TTY+显式开关守卫处数（=2）
+  [32mPASS[0m 收尾无条件 ok 行数（=0）
+
+[36m== 8. scripts/update-from-github.sh 与 verify-migration.sh ==[0m
+  [32mPASS[0m update-from-github --help 以 0 结束（非崩溃）
+  [32mPASS[0m verify-migration --help 以 1 结束（非崩溃）
+  [32mPASS[0m verify-migration 计数不再用 ((PASS++))
+
+[36m== 9. systemd 单元（真 systemd-analyze verify） ==[0m
+  [32mPASS[0m systemd-analyze verify 无指令级错误
+  [32mPASS[0m gipfel.service 已移除 Unix socket
+  [32mPASS[0m gipfel.service 运行目录 0750
+  [32mPASS[0m logviewer.service UMask=0027
+
+[36m== 10. print_rollback_hint 输出 ==[0m
+  [32mPASS[0m 回滚指引含：systemctl stop gipfel gipfel-logviewer
+  [32mPASS[0m 回滚指引含：checkout 'abc1234'
+  [32mPASS[0m 回滚指引含：npm ci
+  [32mPASS[0m 回滚指引含：api/health
+  [32mPASS[0m 回滚指引含：只含数据
+
+[36m════ 汇总 ════[0m
+  PASS=44 FAIL=0

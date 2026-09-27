@@ -116,7 +116,7 @@ sudo chown -R gipfel:gipfel "$INSTALL_DIR/backend"
 ## 验证方式
 
 ```bash
-bash code_audit/_repro_gipfel_user_group.sh   # 期望 PASS=16 FAIL=0
+bash code_audit/harness/_repro_gipfel_user_group.sh   # 期望 PASS=16 FAIL=0
 ```
 
 相关断言（Debian 13 实测）：

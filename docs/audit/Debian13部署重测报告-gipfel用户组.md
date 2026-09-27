@@ -89,7 +89,7 @@ useradd -> 未找到
 
 ## 2. Debian 13 实测：16 项断言 16/16 PASS
 
-脚本：`code_audit/_repro_gipfel_user_group.sh`（以 root 运行，自动创建/清理临时用户组、目录与临时 systemd 单元）
+脚本：`code_audit/harness/_repro_gipfel_user_group.sh`（以 root 运行，自动创建/清理临时用户组、目录与临时 systemd 单元）
 
 ```
 环境：Debian GNU/Linux 13 (trixie) / useradd=/usr/sbin/useradd
@@ -235,7 +235,7 @@ ensure_runtime_user() {
 
 ③ `migrate-server.sh`：两处 `useradd` 补 `-U`（或改调同一 helper）；push 模式把 `:329` 的 chown 移到建用户之后并去掉 `2>/dev/null`。
 ④ 文档：`docs/MIGRATION.md:242` 同步；`deploy/README.md` 增补"**必须 `su -` 或 `sudo`，不要用 `su`；先确认 `getent group gipfel` 是否为"组在用户不在"状态**"。
-⑤ 回归：`code_audit/_repro_gipfel_user_group.sh` 已覆盖 A–E 五个场景（16 断言），改完直接复跑即可。
+⑤ 回归：`code_audit/harness/_repro_gipfel_user_group.sh` 已覆盖 A–E 五个场景（16 断言），改完直接复跑即可。
 
 同时建议给 `chown` 步加前置断言（如 `id gipfel && getent group gipfel || err …`），避免再次以"权限错误"的面目暴露用户创建失败。
 
@@ -250,7 +250,7 @@ ensure_runtime_user() {
 | 数据库/配置备份 | `/opt/gipfel/_backup/2026-09-23_233738` |
 | 部署日志 | VM `/tmp/deploy-retest.log`（保留） |
 | 临时测试脚本 | 已清理（`/tmp/retest1.sh`、`/tmp/harness.sh`、`/tmp/precheck.sh` 等） |
-| 本机仓库 | 仅新增 `code_audit/_repro_gipfel_user_group.sh`（回归脚本），**未改动任何部署脚本/文档** |
+| 本机仓库 | 仅新增 `code_audit/harness/_repro_gipfel_user_group.sh`（回归脚本），**未改动任何部署脚本/文档** |
 
 ---
 
@@ -258,10 +258,10 @@ ensure_runtime_user() {
 
 ```bash
 # 在 Linux（真 root，真 useradd，真 systemd）上执行
-bash code_audit/_repro_gipfel_user_group.sh     # 期望 PASS=16 FAIL=0
+bash code_audit/harness/_repro_gipfel_user_group.sh     # 期望 PASS=16 FAIL=0
 # WSL 环境示例：
-wsl -u root -e bash -lc "sed -i 's/\r$//' /mnt/c/.../code_audit/_repro_gipfel_user_group.sh; \
-                         bash /mnt/c/.../code_audit/_repro_gipfel_user_group.sh"
+wsl -u root -e bash -lc "sed -i 's/\r$//' /mnt/c/.../code_audit/harness/_repro_gipfel_user_group.sh; \
+                         bash /mnt/c/.../code_audit/harness/_repro_gipfel_user_group.sh"
 ```
 
 脚本自带清理（临时用户 `gipfel`/`gtmp`、`/opt/gipfel-repro*`、临时 systemd 单元），不影响 `/opt/gipfel` 真实部署。

@@ -111,7 +111,7 @@ ensure_runtime_user() {
 ## 验证方式
 
 ```bash
-bash code_audit/_repro_gipfel_user_group.sh   # 期望 PASS=16 FAIL=0，其中场景 B/C 即本 issue
+bash code_audit/harness/_repro_gipfel_user_group.sh   # 期望 PASS=16 FAIL=0，其中场景 B/C 即本 issue
 ```
 
 | 场景 | 断言 | 实测（Debian 13） |

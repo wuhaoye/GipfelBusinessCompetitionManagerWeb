@@ -71,10 +71,21 @@
 
 ## 归档说明
 
-- 本目录下的报告**全部入库**；与之配套的取证中间产物（`_before`/`_after` 代码快照、`_*_patch.py`、`_*_harness.*`、`_merge/`、`_probe_tmp/`、`_rules/*.txt`、运行日志、索引生成器 `_build_index.py`）**不入库**，已移出到仓库外的本地归档目录。
-- 因此，本目录文档里出现的 `code_audit/...` 路径指**当时的取证工作目录**，不是本仓库的现有路径。其中两类需要特别说明：
-  - **已被本目录取代的**：`code_audit/U01…U14-*.md`、`B01…B08-*.md` → [units/](units)；`code_audit/00-缺陷总索引.md` → [00-缺陷总索引.md](00-缺陷总索引.md)；`code_audit/ops-master/**` → [ops-master/](ops-master)；`code_audit/_rules/*.md` → [rules/](rules)。
-  - **原本就已缺失的**（指向取证期更早的临时文件）：[rules/DATA_FIT_REPORT.md](rules/DATA_FIT_REPORT.md) 指向的 `_rules/_probe/*.txt`、[rules/OPS_READINESS_REPORT.md](rules/OPS_READINESS_REPORT.md) 引用的 `_rules/v3.txt`（现存的是 `v3_full.txt`）、以及 `_rules/xlsx_dump.txt`。这些**在归档前就不存在**，文档内嵌的结论与代码摘录仍可独立阅读。
-- 少数回归用例（如 `tests/fix_verify/scripts/test_x18_bootstrap_guard.py`）会引用当时的 harness；harness 缺失时用例**自动 `skipTest`**（用例内已注明「非交付物，允许缺失」），不影响套件通过。
+- 本目录是**结论性文档**的归档。与之配套的**可复现工具已入库**，在 [`../../code_audit/`](../../code_audit/README.md)：
+  | 子目录 | 内容 |
+  | --- | --- |
+  | `harness/` | 回归 harness（**被 `tests/fix_verify/scripts/test_x*.py` 直接调用**）+ `harness/wsl/` WSL 验证脚本 |
+  | `probes/` | 独立只读复核探针（不写业务库） |
+  | `patches/` | 当时的修复补丁脚本（逐条缺陷的落地记录，历史价值） |
+  | `tools/` | `_build_index.py` 等生成器 |
+  | `archives/` | 被本文档引用的原始输出存档（`_WSL_verify_out.txt`、`_wsl21_out.txt`） |
+- **不入库的是一次性过程产物**：291 个 `_before`/`_after` 代码快照、43 个 `_*_msg.txt` 提交信息草稿、`_merge/` 合并过程、运行日志 —— 已移出到仓库外的 `../gipfel-archive-20260926/`（该目录内附逐项对照说明）。
+- 因此本目录文档里出现的 `code_audit/...` 路径分四类：
+  - **已在仓库中**（可直接打开）：`code_audit/harness/**`、`code_audit/probes/**`、`code_audit/tools/**`、`code_audit/archives/**`。
+  - **已归档到本目录**：`code_audit/U01…U14-*.md`、`B01…B08-*.md` → [units/](units)；`code_audit/00-缺陷总索引.md` → [00-缺陷总索引.md](00-缺陷总索引.md)；`code_audit/ops-master/**` → [ops-master/](ops-master)；`code_audit/_rules/*.md` → [rules/](rules)。
+  - **已移出仓库**：形如 `code_audit/_x18_before.txt`、`code_audit/_X0109_msg.txt`、`code_audit/_merge/*` 的取证快照与草稿。
+  - **原本就已缺失**（指向取证期更早的临时文件）：[rules/DATA_FIT_REPORT.md](rules/DATA_FIT_REPORT.md) 指向的 `_rules/_probe/*.txt`、[rules/OPS_READINESS_REPORT.md](rules/OPS_READINESS_REPORT.md) 引用的 `_rules/v3.txt`（现存的是 `v3_full.txt`）、`_rules/xlsx_dump.txt`，以及 [units/B06-excel.md](units/B06-excel.md) 引用的 `_b06_probe*.py` / `_b06_out/`。
+- **索引可重跑再生**：`backend\.venv\Scripts\python.exe code_audit\tools\_build_index.py` 会从 [units/](units) 重新生成 [00-缺陷总索引.md](00-缺陷总索引.md)，输出与当前入库版本**逐字节一致**（21 单元 / 368 条）。
+- `tests/fix_verify/scripts/test_x18/x19/x20/x21/x22/x24/x25` 直接调用 `code_audit/harness/*`：harness **已随仓库提供**，仅在缺失时才 `skipTest`。纯 Python 的 `_x18`/`_x19` 在 Windows 上真实执行；依赖 bash 的在无 bash 时跳过、在 Linux 上真实执行。
 - [issues/](issues) 下 7 份是**可直接粘贴成 GitHub Issue 的立案草案**，尚未提交到 issue tracker。其中 `issue-master-04-dev-launcher-linux.md` 对应的「Linux 开发启动器不可用」**至今仍未修复**，请先落地跟踪再考虑清理。
 

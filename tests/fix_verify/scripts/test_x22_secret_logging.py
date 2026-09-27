@@ -40,7 +40,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[3]
 DEPLOY = REPO / "scripts" / "deploy-linux.sh"
 UPDATE = REPO / "scripts" / "update-from-github.sh"
-HARNESS = REPO / "code_audit" / "_x22_harness.sh"
+HARNESS = REPO / "code_audit" / "harness" / "_x22_harness.sh"
 PY = REPO / "backend" / ".venv" / "Scripts" / "python.exe"
 
 GUARD = 'if [[ -t 1 ]]; then'
@@ -156,7 +156,7 @@ class X22RuntimeTests(unittest.TestCase):
         if _find_bash() is None:
             self.skipTest("本机没有可执行的 bash，跳过真实执行（静态断言已覆盖）")
         if not HARNESS.is_file():
-            self.skipTest("code_audit/_x22_harness.sh 不存在（非交付物，允许缺失）")
+            self.skipTest("code_audit/harness/_x22_harness.sh 不存在（应随仓库提供，请确认已检出）")
 
         proc = subprocess.run(
             [_find_bash(), str(HARNESS)], cwd=str(REPO), capture_output=True, text=True,

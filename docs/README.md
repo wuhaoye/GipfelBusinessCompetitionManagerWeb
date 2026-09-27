@@ -52,6 +52,7 @@
 | 文档 | 内容 |
 | --- | --- |
 | [audit/README.md](audit/README.md) | 审计归档索引：汇总报告、366+ 条缺陷总索引、21 个审计单元、运维对照与规则差距报告 |
+| [../code_audit/README.md](../code_audit/README.md) | 审计**取证工具**目录：回归 harness（**被 `tests/fix_verify/scripts/test_x*.py` 直接调用**）、只读复核探针、补丁脚本、索引生成器、原始输出存档 |
 
 ## 6. 赛务与产品分析
 

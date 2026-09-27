@@ -38,7 +38,7 @@
 
 ```powershell
 $env:WSL_UTF8='1'
-wsl.exe -d Ubuntu-26.04 -- bash /mnt/c/Users/wuhao/Desktop/shang/gipfel/GipfelBusinessCompetitionManagerWeb/code_audit/_wsl_verify.sh
+wsl.exe -d Ubuntu-26.04 -- bash /mnt/c/Users/wuhao/Desktop/shang/gipfel/GipfelBusinessCompetitionManagerWeb/code_audit/harness/wsl/_wsl_verify.sh
 ```
 
 **结果：`PASS=44 FAIL=0`（退出码 0）**
@@ -57,7 +57,7 @@ wsl.exe -d Ubuntu-26.04 -- bash /mnt/c/Users/wuhao/Desktop/shang/gipfel/GipfelBu
 | 9 | **`systemd-analyze verify`**（真 systemd） | ✅ | 无指令级错误；`gipfel.service` 无 `-u …gipfel.sock`；`RuntimeDirectoryMode=0750`；`UMask=0027` |
 | 10 | `print_rollback_hint` | ✅ 5/5 | 六步命令齐全（停服务 / 恢复库 / 恢复上传配置 / 回退代码 / 重装依赖前端 / 起服务健康检查） |
 
-**原始输出存档**：`code_audit/_WSL_verify_out.txt`（含 ANSI 颜色码，去色后阅读即可）
+**原始输出存档**：`code_audit/archives/_WSL_verify_out.txt`（含 ANSI 颜色码，去色后阅读即可）
 
 ---
 
@@ -104,7 +104,7 @@ scripts/lib/deploy-common.sh: line 26: syntax error near unexpected token `$'{\r
 对象库本来就是 LF，所以该规则**不产生任何文件内容变更**，只是把"检出必须是 LF"固定下来，
 防止后续贡献者提交 CRLF 的 shell 脚本。
 
-**修复后复验**：`bash -n` 8/8 OK；`code_audit/_wsl_verify.sh` → `PASS=44 FAIL=0`。
+**修复后复验**：`bash -n` 8/8 OK；`code_audit/harness/wsl/_wsl_verify.sh` → `PASS=44 FAIL=0`。
 
 ### 附带记录：工具链层面的同类陷阱（不是本仓库缺陷，但会反复咬人）
 
@@ -156,9 +156,9 @@ WSL 证明不了的项，必须在真机上做（命令见手册 §4）。待办
 
 | 文件 | 用途 |
 | --- | --- |
-| `code_audit/_wsl_verify.sh` | 主验证脚本，44 项检查（内容与手册 §2.4 内嵌版本一致，已验证可独立运行） |
-| `code_audit/_wsl_eol.sh` | 行尾诊断：对比工作区 / git 对象库的 CRLF-LF，并演示 Linux bash 对 CRLF 的拒收 |
-| `code_audit/_WSL_verify_out.txt` | 主验证脚本的完整原始输出 |
+| `code_audit/harness/wsl/_wsl_verify.sh` | 主验证脚本，44 项检查（内容与手册 §2.4 内嵌版本一致，已验证可独立运行） |
+| `code_audit/harness/wsl/_wsl_eol.sh` | 行尾诊断：对比工作区 / git 对象库的 CRLF-LF，并演示 Linux bash 对 CRLF 的拒收 |
+| `code_audit/archives/_WSL_verify_out.txt` | 主验证脚本的完整原始输出 |
 
-> 说明：`code_audit/` 是**未跟踪**的审计与探针产物目录（与本记录、审计报告同样是本地文件）。
-> 若希望这些内容也进版本库，需要单独说明。
+> 说明：`code_audit/` 当时是**未跟踪**的审计与探针产物目录；**现已入库**（可复现的 harness / 探针 / 补丁 / 生成器 / 输出存档，
+> 见 [`code_audit/README.md`](../code_audit/README.md)），一次性 before/after 快照与提交信息草稿仍留在仓库外。

@@ -858,7 +858,7 @@ proc = subprocess.run([...], capture_output=True, text=True,
 | `test_x19_start_dev_exit.py` | rc=1 `FAILED (failures=1)` | **rc=0 Ran 5 tests OK** |
 
   合并结果另经真 Linux 复核：全部被跟踪 `.sh` 的 `bash -n` **9/9 OK**；
-  `code_audit/_wsl_verify.sh` → **PASS=45 FAIL=0**（45 = 原 44 项 + master 新增的 `tests/https-443-diag.sh`）。
+  `code_audit/harness/wsl/_wsl_verify.sh` → **PASS=45 FAIL=0**（45 = 原 44 项 + master 新增的 `tests/https-443-diag.sh`）。
 
 ---
 

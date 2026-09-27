@@ -13,7 +13,7 @@
 | `contract_watcher/bookkeeping_example/` | `shang.py`（xlwings 记账模板，真正的 xlsx 写入点）、`inspect_xlsx.py`、`run_branch_tests.py`、`soak_test.py` |
 | `test_run_recheck/handlers.before.py`、`handlers.generated_after_test.py` | 仅用于对比：确认自动生成块形态（`# ===== [auto] ContractType.key = …` + `def handle_…_passed`），与当前 `handlers.py`（空模板）行为一致，无额外差异 |
 
-**方法**：全部结论来自 `read`/`grep` 实读源码 + 纯函数级实测（未联网、未启动监听程序、未启动 Excel、未改动任何被审代码）。实测脚本保留在 `code_audit/_probe_cw.py`，原始输出见文末附录 A；`_probe_cw.py` 只在 `code_audit/_probe_tmp` 下写临时文件并自删（沙箱残留一个空目录 `code_audit/_probe_tmp/cwprobe_f8wo5x69`，无内容）。
+**方法**：全部结论来自 `read`/`grep` 实读源码 + 纯函数级实测（未联网、未启动监听程序、未启动 Excel、未改动任何被审代码）。实测脚本保留在 `code_audit/probes/_probe_cw.py`，原始输出见文末附录 A；`_probe_cw.py` 只在 `code_audit/_probe_tmp` 下写临时文件并自删（沙箱残留一个空目录 `code_audit/_probe_tmp/cwprobe_f8wo5x69`，无内容）。
 
 **两条必须先讲清的结构性事实**：
 
@@ -529,7 +529,7 @@ contract_watcher/bookkeeping_example/test_output*/**/*.xlsx
 
 ---
 
-## 附录 A：实测记录（`code_audit/_probe_cw.py`，Python 3.14.6 / xlwings 0.36.5；未联网、未启动 Excel）
+## 附录 A：实测记录（`code_audit/probes/_probe_cw.py`，Python 3.14.6 / xlwings 0.36.5；未联网、未启动 Excel）
 
 A-1 函数名 slug 冲突（对应 CW-06）：
 ```

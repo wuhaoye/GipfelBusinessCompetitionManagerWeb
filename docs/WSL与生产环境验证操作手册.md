@@ -47,7 +47,7 @@
 ```powershell
 # 一条命令跑一个脚本（注意 WSL_UTF8=1，否则中文输出会乱码）
 $env:WSL_UTF8='1'
-wsl.exe -d Ubuntu-26.04 -- bash /mnt/c/Users/wuhao/Desktop/shang/gipfel/GipfelBusinessCompetitionManagerWeb/code_audit/_wsl_verify.sh
+wsl.exe -d Ubuntu-26.04 -- bash /mnt/c/Users/wuhao/Desktop/shang/gipfel/GipfelBusinessCompetitionManagerWeb/code_audit/harness/wsl/_wsl_verify.sh
 ```
 
 > **给 AI 执行者的提示**：若用受限沙箱执行 `wsl.exe` 会报 `Wsl/EnumerateDistros E_ACCESSDENIED`
@@ -72,12 +72,13 @@ sudo apt-get install -y python3-venv python3-pip sqlite3 rsync nginx ufw
 
 ```powershell
 $env:WSL_UTF8='1'
-wsl.exe -d Ubuntu-26.04 -- bash /mnt/c/Users/wuhao/Desktop/shang/gipfel/GipfelBusinessCompetitionManagerWeb/code_audit/_wsl_verify.sh
+wsl.exe -d Ubuntu-26.04 -- bash /mnt/c/Users/wuhao/Desktop/shang/gipfel/GipfelBusinessCompetitionManagerWeb/code_audit/harness/wsl/_wsl_verify.sh
 ```
 
 期望结尾：`PASS=44 FAIL=0`（退出码 0）。
 
-若该脚本不在（`code_audit/` 是未跟踪目录），用 §2.4 的完整脚本内容重建它。
+验证脚本已随仓库提供（`code_audit/harness/wsl/_wsl_verify.sh`，见 [code_audit/README.md](../code_audit/README.md)）。
+万一它缺失，用 §2.4 的完整脚本内容重建即可。
 
 ### 2.2 它验证了什么（44 项明细，**全部已在本机 WSL 实测通过**）
 
@@ -95,7 +96,7 @@ wsl.exe -d Ubuntu-26.04 -- bash /mnt/c/Users/wuhao/Desktop/shang/gipfel/GipfelBu
 | 9 | **`systemd-analyze verify`**（真 systemd） | 无指令级错误；`gipfel.service` 无 `-u …gipfel.sock`；`RuntimeDirectoryMode=0750`；`UMask=0027` | ✅ |
 | 10 | `print_rollback_hint` | 六步命令齐全（停服务/恢复库/恢复上传配置/回退代码/重装依赖前端/起服务健康检查） | ✅ 5/5 |
 
-> 原始输出存档：`code_audit/_WSL_verify_out.txt`。
+> 原始输出存档：`code_audit/archives/_WSL_verify_out.txt`。
 
 ### 2.3 在真 Linux 文件系统上再跑一遍（可选，更接近生产）
 
@@ -105,18 +106,18 @@ rm -rf /tmp/gipfel-repo && mkdir -p /tmp/gipfel-repo
 git -C "$REPO" archive HEAD | tar -x -C /tmp/gipfel-repo          # 只含被跟踪文件，LF 行尾
 cd /tmp/gipfel-repo
 bash -n $(git -C "$REPO" ls-files '*.sh') && echo "语法 OK"
-REPO=/tmp/gipfel-repo bash "$REPO/code_audit/_wsl_verify.sh"      # 脚本需一并存在
+REPO=/tmp/gipfel-repo bash "$REPO/code_audit/harness/wsl/_wsl_verify.sh"      # 脚本需一并存在
 ```
 
-> 注：`git archive` 出来的树**不含** `code_audit/`（未跟踪），所以要么把验证脚本单独拷进去，
-> 要么先 `cp -r "$REPO/code_audit" /tmp/gipfel-repo/`。
+> 注：`git archive` 出来的树**只含被跟踪文件**。验证脚本已在版本库中（`code_audit/` 已入库），
+> 因此 `git archive` 出来的树里**有**它；若你手边是旧快照或单独拷贝的目录，先 `cp -r "$REPO/code_audit" /tmp/gipfel-repo/` 亦可。
 
-### 2.4 验证脚本完整内容（`code_audit/_wsl_verify.sh`，可原样重建）
+### 2.4 验证脚本完整内容（`code_audit/harness/wsl/_wsl_verify.sh`，可原样重建）
 
 ```bash
 #!/usr/bin/env bash
 # 生产相关 bash 内容的 WSL(Ubuntu) 复验脚本
-# 用法：wsl -d Ubuntu-26.04 -- bash code_audit/_wsl_verify.sh
+# 用法：wsl -d Ubuntu-26.04 -- bash code_audit/harness/wsl/_wsl_verify.sh
 # 退出码：0 = 全部通过；非 0 = 有失败项
 set -uo pipefail
 
@@ -466,7 +467,7 @@ systemctl is-active gipfel gipfel-logviewer
 第一层（WSL 真实 Linux）
   [ ] bash -n 8/8 OK
   [ ] tests/deploy_public_ip_test.sh 三种 cwd 均 PASS=36 FAIL=0
-  [ ] code_audit/_wsl_verify.sh → PASS=__ FAIL=__
+  [ ] code_audit/harness/wsl/_wsl_verify.sh → PASS=__ FAIL=__
   [ ] （可选）manage.py test apps / tests_fix_verify → __ / __
 
 第二层（真机）
@@ -488,7 +489,7 @@ systemctl is-active gipfel gipfel-logviewer
 ## 6. 本机已跑过的实测记录（可核对）  ✅ 已实测
 
 > 本节是同一次运行的摘要；**完整版（含环境、逐项状态表、缺陷 X-27 的完整取证、待办清单）**
-> 见《[WSL与生产环境验证结果记录.md](WSL与生产环境验证结果记录.md)》。原始输出：`code_audit/_WSL_verify_out.txt`。
+> 见《[WSL与生产环境验证结果记录.md](WSL与生产环境验证结果记录.md)》。原始输出：`code_audit/archives/_WSL_verify_out.txt`。
 
 **第一层（WSL Ubuntu 26.04 / GNU bash 5.3.9 / systemd 为 PID1）**
 

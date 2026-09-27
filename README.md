@@ -117,6 +117,8 @@ GipfelBusinessCompetitionManagerWeb/
 │
 ├── widget-package-examples/         自定义控件包示例（progress-bar、simple-card）
 ├── architecture_diagram/            架构图资源
+├── code_audit/                      审计取证工具（回归 harness / 只读探针 / 补丁脚本 / 生成器 / 原始存档）
+│   └── README.md                       ← 说明「哪些被回归用例调用」「移动前必读」
 ├── tests/                           验证与探针脚本（fix_verify 回归套件 / ops_check 独立验收 / snapshot_tools）
 ├── logs/                            开发期日志（gitignore；生产由 backend/logs/ 托管）
 ├── uploads/                         开发期上传文件（生产由 backend/uploads/ 托管）

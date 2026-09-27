@@ -42,7 +42,7 @@ REPO = Path(__file__).resolve().parents[3]
 QUICK = REPO / "scripts" / "quick-sync.sh"
 LIB = REPO / "scripts" / "lib" / "deploy-common.sh"
 MIG = REPO / "scripts" / "migrate-server.sh"
-HARNESS = REPO / "code_audit" / "_x20_harness.py"
+HARNESS = REPO / "code_audit" / "harness" / "_x20_harness.py"
 PY = REPO / "backend" / ".venv" / "Scripts" / "python.exe"
 
 
@@ -118,7 +118,7 @@ class X20RuntimeTests(unittest.TestCase):
         if bash is None:
             self.skipTest("本机没有可执行的 bash，跳过真实执行（静态断言已覆盖）")
         if not HARNESS.is_file():
-            self.skipTest("code_audit/_x20_harness.py 不存在（非交付物，允许缺失）")
+            self.skipTest("code_audit/harness/_x20_harness.py 不存在（应随仓库提供，请确认已检出）")
 
         proc = subprocess.run(
             [str(PY), str(HARNESS)], cwd=str(REPO), capture_output=True, text=True,

@@ -98,10 +98,12 @@ contract_watcher/config.json.tmp
 contract_watcher/**/*.xlsx.bak*
 contract_watcher/bookkeeping_example/no-such.xlsx
 
-# ===== 中间过程产物（2026-09 基线整理：结论性文档已归档，产物不再入库）=====
-# 审计/探针取证工作目录：只放临时产物（before/after 代码快照、patch/harness、运行输出）。
-# 结论性报告已归档至 docs/audit/ —— 见 docs/audit/README.md 的「归档说明」。
-code_audit/
+# ===== 中间过程产物（2026-09 基线整理）=====
+# `code_audit/` **已入库**（见 code_audit/README.md）：只保留可复现的 harness / 补丁 / 探针 / 工具，
+# 以及被文档与回归用例引用的输出存档；一次性 before/after 代码快照与提交信息草稿属过程产物，不入库。
+# 因此这里只忽略 harness 运行时可能产生的临时目录（历史取证期出现过）：
+code_audit/_probe_tmp/
+code_audit/.probe/
 # 独立验收套件的原始运行日志（可用 tests/ops_check/run_all.cmd 原样重跑再生）
 tests/ops_check/_artifacts/
 # 分支差异的机器生成 diff（数百 KB ~ 数 MB，可用 docs/branch-diff/gen-report.ps1 重跑再生）

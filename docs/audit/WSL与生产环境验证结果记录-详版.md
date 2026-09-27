@@ -23,13 +23,13 @@
 
 ## 第一层（WSL 真实 Linux）
 
-- [x] **§2.1 `code_audit/_wsl_verify.sh` → `PASS=44 FAIL=0`（退出码 0）**
+- [x] **§2.1 `code_audit/harness/wsl/_wsl_verify.sh` → `PASS=44 FAIL=0`（退出码 0）**
 - [x] **§2.2 分段明细全部符合期望**（见下）
 - [x] **§2.3 在 Linux 侧文件系统上复跑 → 脚本 36 项 + 手工补齐段 1 的 8 项 = 44/44**
 - [x] **§3 行尾前置检查：工作区 CRLF 文件数 = 0**
 - [x] **§2.5 Python 侧回归四项全部通过**（Windows 与 WSL 双侧一致，见下）
 
-### §2.1 / §2.2 分段明细（原始输出 `code_audit/_wsl21_out.txt`）
+### §2.1 / §2.2 分段明细（原始输出 `code_audit/archives/_wsl21_out.txt`）
 
 | 段 | 内容 | 期望 | 实测 |
 | --- | --- | --- | --- |

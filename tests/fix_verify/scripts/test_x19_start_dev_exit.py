@@ -36,7 +36,7 @@ from _decoding import run_captured
 REPO = Path(__file__).resolve().parents[3]
 BAT = REPO / "scripts" / "start-dev.bat"
 DEV_PY = REPO / "scripts" / "dev.py"
-HARNESS = REPO / "code_audit" / "_x19_harness.py"
+HARNESS = REPO / "code_audit" / "harness" / "_x19_harness.py"
 PY = REPO / "backend" / ".venv" / "Scripts" / "python.exe"
 
 
@@ -85,7 +85,7 @@ class X19StaticTests(unittest.TestCase):
 class X19RuntimeTests(unittest.TestCase):
     def _harness_output(self) -> str:
         if not HARNESS.is_file():
-            self.skipTest("code_audit/_x19_harness.py 不存在（非交付物，允许缺失）")
+            self.skipTest("code_audit/harness/_x19_harness.py 不存在（应随仓库提供，请确认已检出）")
         proc = run_captured(
             [str(PY), str(HARNESS), "after"],
             cwd=str(REPO),

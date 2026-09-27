@@ -137,7 +137,7 @@ id gipfel >/dev/null 2>&1 && getent group gipfel >/dev/null 2>&1 \
 在真机（root + 真 `useradd` + 真 systemd）上跑：
 
 ```bash
-bash code_audit/_repro_gipfel_user_group.sh     # 期望 PASS=16 FAIL=0
+bash code_audit/harness/_repro_gipfel_user_group.sh     # 期望 PASS=16 FAIL=0
 ```
 
 其中场景 A：无 `gipfel` 用户、无组、安装目录不存在的**全新机器**上，`useradd -r -s /usr/sbin/nologin -U -d "$INSTALL_DIR" gipfel` 退出码 0、`chown -R gipfel:gipfel` 退出码 0 —— 即"系统里没有 gipfel 用户和组"本身**不是**缺陷，缺陷在于环境 PATH 与被吞掉的错误。

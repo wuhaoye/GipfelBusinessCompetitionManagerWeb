@@ -37,7 +37,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
 BAT = REPO / "scripts" / "bootstrap-dev.bat"
-HARNESS = REPO / "code_audit" / "_x18_harness.py"
+HARNESS = REPO / "code_audit" / "harness" / "_x18_harness.py"
 PY = REPO / "backend" / ".venv" / "Scripts" / "python.exe"
 
 
@@ -123,7 +123,7 @@ class X18StaticTests(unittest.TestCase):
 class X18RuntimeTests(unittest.TestCase):
     def test_guard_survives_two_calls_in_one_cmd_session(self):
         if not HARNESS.is_file():
-            self.skipTest("code_audit/_x18_harness.py 不存在（非交付物，允许缺失）")
+            self.skipTest("code_audit/harness/_x18_harness.py 不存在（应随仓库提供，请确认已检出）")
         proc = subprocess.run(
             [str(PY), str(HARNESS), "after"],
             cwd=str(REPO),

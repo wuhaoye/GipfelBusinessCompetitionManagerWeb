@@ -70,10 +70,12 @@ FileNotFoundError: [Errno 2] No such file or directory:
 | --- | --- | --- | --- |
 | `test_x17_db_safety.py` | 3 | 是（2） | **3 errors + 1 failure** |
 | `test_cw21_exit_codes.py` | 3 | 是（2） | **2 errors** |
-| `test_x18/x19/x20/x21` | 3/3/2/2 | 是（1） | 通过——因 `code_audit/_xNN_harness.py` 不在仓库而 `skipTest` |
+| `test_x18/x19/x20/x21` | 3/3/2/2 | 是（1） | 通过——当时因 `code_audit/harness/_xNN_harness.py` 未入库而 `skipTest`（**已修复**，见下） |
 | `test_x10/x22/x24/x25` | 1 | 否 | 通过（路径未被使用） |
 
-> 仓库里 `code_audit/` 是非交付目录（未跟踪），因此那 4 个文件的"真实执行"断言在**任何干净 clone** 上都恒被跳过——属于覆盖面静默丢失，建议一并处理。
+> **后续处理（已完成）**：报告当时指出的「`code_audit/` 是非交付目录（未跟踪），4 个文件的『真实执行』断言在任何干净 clone 上都恒被跳过 = 覆盖面静默丢失」已修复 ——
+> 10 个 harness 与 5 个补丁/探针/生成器/存档已入库到 [`code_audit/harness/`](../../code_audit/README.md) 等子目录，回归用例改为直接调用它们。
+> `_x18`/`_x19` 这类纯 Python harness 在 Windows 上会真实执行；`_x10`/`_x20`/`_x21`/`_x22`/`_x24`/`_x25` 依赖 bash，本机无 bash 时仍跳过、在 Linux 上真实执行。
 
 ### 3.2【P1，含危险】`test_b01_stop_safety` 与 POSIX 分支耦合
 
